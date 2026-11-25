@@ -283,7 +283,7 @@ fn chown_tree(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn read_artifact(root: &Path, name: &str, limit: usize) -> io::Result<Vec<u8>> {
+pub fn open_artifact(root: &Path, name: &str, limit: usize) -> io::Result<(File, usize)> {
     let parts = workspace_parts(name)?;
     let (name, parents) = parts
         .split_last()
@@ -300,12 +300,7 @@ pub fn read_artifact(root: &Path, name: &str, limit: usize) -> io::Result<Vec<u8
     if !stat.is_file() || stat.nlink() != 1 || stat.len() > limit as u64 {
         return Err(invalid("invalid artifact"));
     }
-    let mut data = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut data)?;
-    if data.len() > limit {
-        return Err(invalid("artifact exceeds byte limit"));
-    }
-    Ok(data)
+    Ok((file, stat.len() as usize))
 }
 
 use std::os::unix::fs::OpenOptionsExt;

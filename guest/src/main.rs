@@ -1,3 +1,4 @@
+mod artifacts;
 mod execute;
 mod workspace;
 
@@ -27,6 +28,7 @@ pub struct Work {
     expires: u64,
     #[serde(default)]
     claim: String,
+    artifact_limit: Option<usize>,
 }
 
 fn no_deadline() -> u64 {
@@ -101,6 +103,8 @@ struct Running {
     staging: bool,
     logs: Vec<Value>,
     result: Option<Value>,
+    artifacts: Vec<artifacts::Artifact>,
+    transfers: usize,
 }
 
 type Task = Arc<Mutex<Option<Running>>>;
@@ -138,6 +142,8 @@ fn start(mut request: tiny_http::Request, root: &Path, task: &Task) {
         staging: true,
         logs: Vec::new(),
         result: None,
+        artifacts: Vec::new(),
+        transfers: 0,
     });
     let prepared = prepare(&work, root, Some(&mut input));
     drop(input);
@@ -157,7 +163,7 @@ fn start(mut request: tiny_http::Request, root: &Path, task: &Task) {
     let root = root.to_owned();
     let task = Arc::clone(task);
     thread::spawn(move || {
-        let result = execute(&work, &root, |channel, text| {
+        let mut result = execute(&work, &root, |channel, text| {
             task.lock()
                 .unwrap()
                 .as_mut()
@@ -165,8 +171,50 @@ fn start(mut request: tiny_http::Request, root: &Path, task: &Task) {
                 .logs
                 .push(json!({ "channel": channel, "text": text }));
         });
-        task.lock().unwrap().as_mut().unwrap().result = Some(result);
+        let artifacts = artifacts::collect(&work, &root, &mut result);
+        let mut running = task.lock().unwrap();
+        let running = running.as_mut().unwrap();
+        running.artifacts = artifacts;
+        running.result = Some(result);
     });
+}
+
+fn valid_claim(request: &tiny_http::Request, claim: &str) -> bool {
+    request
+        .headers()
+        .iter()
+        .any(|header| header.field.equiv("x-spool-claim") && header.value.as_str() == claim)
+}
+
+fn artifact(request: tiny_http::Request, index: usize, task: Task) {
+    let transfer = {
+        let mut running = task.lock().unwrap();
+        running
+            .as_mut()
+            .filter(|job| valid_claim(&request, &job.claim))
+            .and_then(|job| {
+                let artifact = job.artifacts.get(index)?;
+                let reader = artifact.reader().ok()?;
+                job.transfers += 1;
+                Some((reader, artifact.size()))
+            })
+    };
+    let Some((reader, length)) = transfer else {
+        reply(request, 404, None);
+        return;
+    };
+    let header = tiny_http::Header::from_bytes("Content-Type", "application/octet-stream").unwrap();
+    let _ = request.respond(tiny_http::Response::new(
+        tiny_http::StatusCode(200),
+        vec![header],
+        reader,
+        Some(length),
+        None,
+    ));
+    let mut running = task.lock().unwrap();
+    let running = running.as_mut().unwrap();
+    running.transfers -= 1;
+    running.contact = Instant::now();
 }
 
 fn status(request: tiny_http::Request, query: &str, task: &Task) {
@@ -177,15 +225,12 @@ fn status(request: tiny_http::Request, query: &str, task: &Task) {
         reply(request, 400, None);
         return;
     };
-    let valid_claim = |claim: &str| {
-        request
-            .headers()
-            .iter()
-            .any(|header| header.field.equiv("x-spool-claim") && header.value.as_str() == claim)
-    };
     let (code, page) = {
         let mut running = task.lock().unwrap();
-        match running.as_mut().filter(|job| valid_claim(&job.claim)) {
+        match running
+            .as_mut()
+            .filter(|job| valid_claim(&request, &job.claim))
+        {
             None => (404, None),
             Some(job) if cursor > job.logs.len() => (400, None),
             Some(job) => {
@@ -217,7 +262,9 @@ fn http(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             thread::sleep(Duration::from_millis(250));
             if watchdog.lock().unwrap().as_ref().is_some_and(|job| {
                 now_ms() >= job.expires
-                    || (!job.staging && job.contact.elapsed() >= CONTACT_TIMEOUT)
+                    || (!job.staging
+                        && job.transfers == 0
+                        && job.contact.elapsed() >= CONTACT_TIMEOUT)
             }) {
                 process::exit(124);
             }
@@ -240,6 +287,14 @@ fn http(root: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
             (tiny_http::Method::Get, "/status") => status(request, query, &task),
+            (tiny_http::Method::Get, path) if path.starts_with("/artifact/") => {
+                if let Ok(index) = path["/artifact/".len()..].parse::<usize>() {
+                    let task = Arc::clone(&task);
+                    thread::spawn(move || artifact(request, index, task));
+                } else {
+                    reply(request, 404, None);
+                }
+            }
             _ => reply(request, 404, None),
         }
     }
@@ -300,6 +355,12 @@ fn stdio(root: &Path, stream: bool) -> io::Result<()> {
     };
     if let Some(error) = write_error {
         return Err(error);
+    }
+    let artifacts = artifacts::collect(&work, root, &mut result);
+    for artifact in &artifacts {
+        if stream {
+            artifact.emit(&mut output)?;
+        }
     }
     if stream {
         result = json!({ "type":"result", "result":result });

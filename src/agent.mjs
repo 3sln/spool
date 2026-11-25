@@ -60,7 +60,17 @@ async function processMessage(message) {
       try {
         result = await executor(work, executionSignal, job.id,
           (chunk) => call(job.id, "log", { claim: work.claim, chunk }),
-          (index) => call(job.id, "layer", { claim: work.claim, index }));
+          (index) => call(job.id, "layer", { claim: work.claim, index }),
+          async (artifact, body) => {
+            const response = await fetch(new URL(`/internal/${job.id}/artifact`, coordinator), {
+              method: "POST", redirect: "error", duplex: "half", body, signal: executionSignal,
+              headers: {
+                authorization: `Bearer ${env.SPOOL_WORKER_TOKEN}`, "x-spool-claim": work.claim,
+                "x-spool-artifact": encodeURIComponent(JSON.stringify(artifact)),
+              },
+            });
+            if (response.status !== 204) throw new Error(`Artifact staging returned ${response.status}`);
+          });
       }
       catch (error) { console.error("OCI execution:", error.message); result = { error: "SANDBOX_FAILURE" }; }
       finally { clearInterval(cancellation); }

@@ -26,6 +26,15 @@ export function nodeHandler(service, auth, { origins = [], workerAuth } = {}) {
     const [, , id, action, ...rest] = path.split("/");
     if (request.method !== "POST" || rest.length || !taskPattern.test(id ?? "")) return json({ error: "NOT_FOUND" }, 404);
     try {
+      if (action === "artifact") {
+        const encoded = request.headers.get("x-spool-artifact") ?? "";
+        if (!encoded || encoded.length > 8192) return json({ error: "INVALID_MANIFEST" }, 400);
+        let metadata;
+        try { metadata = JSON.parse(decodeURIComponent(encoded)); }
+        catch { return json({ error: "INVALID_MANIFEST" }, 400); }
+        await service.stageArtifact(id, request.headers.get("x-spool-claim"), metadata, request);
+        return new Response(null, { status: 204 });
+      }
       const body = await readJSON(request, action === "finish" ? 2 * 1024 ** 2 : action === "log" ? 32 * 1024 : 1024);
       if (action === "claim" && typeof body?.epoch === "string") {
         const work = await service.claim(id, body.epoch);
@@ -62,9 +71,11 @@ export async function start(env = process.env, overrides = {}) {
   const workerAuth = env.SPOOL_NATS_URL ? staticToken(env.SPOOL_WORKER_TOKEN) : undefined;
   const queue = env.SPOOL_NATS_URL ? await connectQueue(env, true) : undefined;
   const data = openData(file);
-  const temporary = file === ":memory:" && !objectStorage ? await mkdtemp(`${tmpdir()}/spool-blobs-`) : undefined;
-  const blobs = objectStorage?.blobs ?? fileBlobs(temporary ?? `${file}.layers`, data.blobs);
-  const service = new TaskService(data.store, blobs, { concurrency: workers, limits, transfers: objectStorage?.transfers });
+  const temporary = file === ":memory:" ? await mkdtemp(`${tmpdir()}/spool-blobs-`) : undefined;
+  const localBlobs = fileBlobs(temporary ?? `${file}.layers`, data.blobs);
+  const service = new TaskService(data.store, objectStorage?.blobs ?? localBlobs, {
+    concurrency: workers, limits, transfers: objectStorage?.transfers, artifactStorage: localBlobs,
+  });
   const handler = nodeHandler(service, auth, { origins: env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], workerAuth });
   const executor = overrides.executor ?? ociExecutor(env);
   const active = new Map();

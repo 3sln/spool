@@ -6,11 +6,12 @@ mod replay;
 pub use layer::{Entry, LayerCache, TAR, TAR_GZIP, build_layer, describe, describe_reader};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     error::Error as StdError,
     fmt::{self, Display},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -227,7 +228,10 @@ impl Client {
                 .header("accept", "text/event-stream")
                 .header("last-event-id", cursor.to_string());
         }
-        let agent = if method == "PUT" || url.path().ends_with("/complete") {
+        let agent = if method == "PUT"
+            || url.path().ends_with("/complete")
+            || (method == "GET" && url.path().contains("/artifacts/"))
+        {
             &self.transfer_agent
         } else {
             &self.agent
@@ -480,15 +484,32 @@ impl Client {
             return Err(Error::Invalid("Artifact exceeds the client limit"));
         }
         let mut bytes = Vec::new();
-        self.request("GET", &artifact.url, &[][..], None, None, true)?
-            .body_mut()
-            .as_reader()
-            .take(artifact.size as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() != artifact.size || layer::sha256(&bytes) != artifact.digest {
+        self.download_to(artifact, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Stream the declared bytes into a writer and verify the recorded SHA-256.
+    pub fn download_to(&self, artifact: &Artifact, mut writer: impl Write) -> Result<()> {
+        let mut response = self.request("GET", &artifact.url, &[][..], None, None, true)?;
+        let mut reader = response.body_mut().as_reader();
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        let mut remaining = artifact.size;
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            remaining = remaining
+                .checked_sub(count)
+                .ok_or(Error::Invalid("Artifact exceeded its declared size"))?;
+            hash.update(&buffer[..count]);
+            writer.write_all(&buffer[..count])?;
+        }
+        if remaining != 0 || layer::hex_digest(hash.finalize()) != artifact.digest {
             return Err(Error::Invalid("Artifact bytes do not match the descriptor"));
         }
-        Ok(bytes)
+        Ok(())
     }
 
     /// Consume one bounded SSE response. Call again using the last delivered cursor to reconnect.

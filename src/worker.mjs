@@ -72,9 +72,21 @@ export class TenantRunner extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     const transfers = r2Transfers(env);
-    this.service = new TaskService(stateStorage(ctx.storage), objectStorage(env.LAYERS), {
+    const blobs = objectStorage(env.LAYERS);
+    const artifactStorage = {
+      open: blobs.open,
+      delete: blobs.delete,
+      async putVerified(key, request, { size, digest }) {
+        const stream = new FixedLengthStream(size);
+        await Promise.all([
+          (request.body ?? new Response(new Uint8Array()).body).pipeTo(stream.writable, { signal: request.signal }),
+          env.LAYERS.put(key, stream.readable, { sha256: digest.slice(7) }),
+        ]);
+      },
+    };
+    this.service = new TaskService(stateStorage(ctx.storage), blobs, {
       wake: () => this.schedule(Date.now() + 50), limits: workerLimits(env, transfers), transfers,
-      stop: (id, claim) => this.stop(id, claim),
+      stop: (id, claim) => this.stop(id, claim), artifactStorage,
     });
   }
 
@@ -150,6 +162,17 @@ export class TenantRunner extends DurableObject {
       }
       if (!await this.service.guestProgress(id, claim, cursor, page)) return;
       if (page.result) {
+        const stopWatching = this.service.watchDeadline(id);
+        try {
+          for (const [index, artifact] of (page.result.artifacts ?? []).entries()) {
+            if (!artifact.digest) continue;
+            const stream = await this.slot(id, claim).fetch(`${internal}/artifact/${index}`, {
+              headers: { "x-spool-claim": claim },
+            });
+            if (!stream.ok) throw new Error(`Guest artifact returned ${stream.status}`);
+            await this.service.stageArtifact(id, claim, artifact, stream);
+          }
+        } finally { stopWatching(); }
         await this.service.finish(id, claim, page.result);
         this.stop(id, claim);
       } else if (page.logs.length === 32) {
@@ -174,11 +197,12 @@ export class GuestSlot extends DurableObject {
       await this.ctx.storage.deleteAlarm();
       return new Response(null, { status: 204 });
     }
-    if (path === "/status" && request.method === "GET" && container.running) {
+    const artifact = /^\/artifact\/[0-7]$/u.test(path);
+    if ((path === "/status" || artifact) && request.method === "GET" && container.running) {
       await container.setInactivityTimeout(guestIdleMs);
-      return container.getTcpPort(8080).fetch(`${guestOrigin}/status${url.search}`, {
+      return container.getTcpPort(8080).fetch(`${guestOrigin}${path}${url.search}`, {
         headers: { "x-spool-claim": request.headers.get("x-spool-claim") ?? "" },
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(artifact ? 600_000 : 5000),
       });
     }
     if (path !== "/start" || request.method !== "POST") return new Response(null, { status: 404 });

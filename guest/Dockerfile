@@ -5,8 +5,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-    cargo build --release --locked --target x86_64-unknown-linux-musl \
+    if [ "$(uname -m)" != x86_64 ]; then export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld; fi \
+    && cargo build --release --locked --target x86_64-unknown-linux-musl \
     && cp target/x86_64-unknown-linux-musl/release/spool-guest /spool-guest
 
 FROM debian:bookworm-slim@sha256:311f7a192fd9a92b165a86b32fa3aae9005b11849bfb1db2d4fd784559ee464f

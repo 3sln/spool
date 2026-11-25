@@ -57,7 +57,7 @@ export function ociExecutor(env) {
   const image = env.SPOOL_OCI_IMAGE ?? defaultGuestImage;
   const workspaceDriver = env.SPOOL_WORKSPACE_DRIVER ?? "tmpfs";
   if (workspaceDriver !== "tmpfs" && workspaceDriver !== "quota") throw new Error("Invalid SPOOL_WORKSPACE_DRIVER");
-  return async (work, signal, id, onLog, readLayer) => {
+  return async (work, signal, id, onLog, readLayer, onArtifact) => {
     const name = `spool-${id}-${work.claim.slice(0, 8)}`;
     const workspace = work.manifest.resources.disk_mib;
     const quota = workspaceDriver === "quota";
@@ -77,7 +77,7 @@ export function ociExecutor(env) {
       if (signal.aborted) return { error: "CANCELLED" };
       return await engineCommand(engine, ["start", "--attach", "--interactive", name], {
         input: workChunks(work, readLayer), signal, timeout: Math.max(1, work.expires - Date.now()),
-        consume: (body) => consumeGuest(new Response(body, { headers: { "content-type": "application/x-ndjson" } }), onLog),
+        consume: (body) => consumeGuest(new Response(body, { headers: { "content-type": "application/x-ndjson" } }), onLog, onArtifact),
       });
     } finally {
       try { await engineCommand(engine, ["rm", "--force", name]); }

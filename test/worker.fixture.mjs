@@ -2,11 +2,17 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import worker, { TenantRunner } from "../src/worker.mjs";
 import { BASE, MEDIA, sha256 } from "../src/contract.mjs";
 
+const artifactBytes = new Uint8Array(700 * 1024).fill(37);
+
 export class TestedTenantRunner extends TenantRunner {
   constructor(ctx, env) {
     super(ctx, { ...env, LAYERS: {
       head: (key) => env.LAYERS.head(key),
-      put: (key, bytes) => env.LAYERS.put(key, bytes),
+      async put(key, body, options) {
+        const bytes = body instanceof Uint8Array ? body : new Uint8Array(await new Response(body).arrayBuffer());
+        if (options?.sha256 && await sha256(bytes) !== `sha256:${options.sha256}`) throw new Error("Digest mismatch");
+        return env.LAYERS.put(key, bytes);
+      },
       delete: (key) => env.LAYERS.delete(key),
       async get(key) {
         const result = await env.LAYERS.get(key);
@@ -17,9 +23,26 @@ export class TestedTenantRunner extends TenantRunner {
 }
 
 export class BlobData extends DurableObject {
-  get(key) { return this.ctx.storage.get(key); }
-  put(key, bytes) { return this.ctx.storage.put(key, bytes); }
-  async delete(key) { await this.ctx.storage.delete(key); }
+  async get(key) {
+    const size = await this.ctx.storage.get(key);
+    if (size === undefined) return undefined;
+    const bytes = new Uint8Array(size);
+    for (let offset = 0; offset < size; offset += 65536) {
+      bytes.set(await this.ctx.storage.get(`${key}:${offset}`), offset);
+    }
+    return bytes;
+  }
+  async put(key, bytes) {
+    for (let offset = 0; offset < bytes.length; offset += 65536) {
+      await this.ctx.storage.put(`${key}:${offset}`, bytes.slice(offset, offset + 65536));
+    }
+    await this.ctx.storage.put(key, bytes.length);
+  }
+  async delete(key) {
+    const size = await this.ctx.storage.get(key);
+    for (let offset = 0; offset < size; offset += 65536) await this.ctx.storage.delete(`${key}:${offset}`);
+    await this.ctx.storage.delete(key);
+  }
 }
 
 export class BlobBinding extends WorkerEntrypoint {
@@ -37,12 +60,14 @@ export class GuestFixture extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/stop") return new Response(null, { status: 204 });
+    if (url.pathname === "/artifact/0" && request.headers.get("x-spool-claim")) return new Response(artifactBytes);
     if (url.pathname === "/status") {
       if (!await this.ctx.storage.get("started")) return new Response(null, { status: 404 });
       if (url.searchParams.get("cursor") === "0") return Response.json({
         logs: [{ channel: "stdout", text: "Cloudflare task running\n" }], cursor: 1, result: null,
       });
-      return Response.json({ logs: [], cursor: 1, result: { exit_code: 0 } });
+      const artifact = { path: "/workspace/artifact", size: artifactBytes.length, digest: await sha256(artifactBytes) };
+      return Response.json({ logs: [], cursor: 1, result: { exit_code: 0, artifacts: [artifact] } });
     }
     if (url.pathname !== "/start") return new Response(null, { status: 404 });
     const payload = await request.text();
@@ -60,6 +85,7 @@ export default {
       protocol_version: "0.1", task_timeout_s: 172800, client_request_id: "worker", platform: { os: "linux", arch: "amd64" },
       environment: { base: BASE, layers: [{ digest, size: bytes.length, media_type: MEDIA[0] }] },
       command: { argv: ["true"], cwd: "/workspace" }, network: { mode: "none" },
+      outputs: { paths: ["/workspace/artifact"] },
       resources: { cpu: 1, memory_mib: 256, disk_mib: 4096 },
     };
     const call = (path, method = "GET", body) => worker.fetch(new Request(`https://spool.example${path}`, {
@@ -85,6 +111,10 @@ export default {
     const replay = await events.text();
     if (!replay.includes("layer.available") || !replay.includes("Cloudflare task running") || !replay.includes("SUCCEEDED")) {
       throw new Error(`Expected a complete Worker task: ${replay}`);
+    }
+    const downloaded = await call(`${initial.links.artifacts}/0`);
+    if (downloaded.status !== 200 || await sha256(await downloaded.arrayBuffer()) !== await sha256(artifactBytes)) {
+      throw new Error("Expected a verified streamed Worker artifact");
     }
   },
 };

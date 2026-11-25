@@ -32,7 +32,11 @@ The initial manifest declares each layer's exact compressed or raw transfer size
 
 All transfer requests have the content length declared by their plan. Presigned requests omit runner credentials. A transport can supply a separate `bearer_token` scoped to its upload URL, and clients should apply their configured destination policy before using it. Completion requests are authenticated to the runner and can be retried.
 
-The cache is scoped to the tenant and can be evicted. The executor verifies the archived bytes again as they enter the offline guest. Cache retention is advisory and independent of the upload and task deadlines. Missing layers at the admission deadline yield `LAYER_UNAVAILABLE`. Artifact downloads require the owning principal and expire with task history.
+The cache is scoped to the tenant and can be evicted. The executor verifies the archived bytes again as they enter the offline guest. Cache retention is advisory and independent of the upload and task deadlines. Missing layers at the admission deadline yield `LAYER_UNAVAILABLE`.
+
+## Artifacts
+
+The runner collects declared regular files in manifest order within the combined `limits.max_artifact_bytes_total` budget. An output that is absent or exceeds the remaining budget is omitted. Artifact listings include the path, byte size, SHA-256 and an authenticated download URL. Downloads are raw byte streams with a `Content-Length` header. They require the owning principal and expire with task history.
 
 ## Client transport
 

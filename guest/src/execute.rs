@@ -2,7 +2,6 @@ use crate::{
     Work,
     workspace::{self, UID},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
     io::{self, Read},
@@ -18,7 +17,6 @@ use std::{
 
 const MAX_LOGS: usize = 128 * 1024;
 const MAX_LOG_EVENTS: usize = 1024;
-const MAX_ARTIFACTS: usize = 512 * 1024;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 type RlimitResource = libc::__rlimit_resource_t;
@@ -231,15 +229,7 @@ fn execute_command(
             json!({"error":"DEADLINE_EXCEEDED","exit_code":code,"output_truncated":truncated}),
         );
     }
-    let mut remaining = MAX_ARTIFACTS;
-    let mut artifacts = Vec::new();
-    for path in &manifest.outputs.paths {
-        if let Ok(bytes) = workspace::read_artifact(root, path, remaining) {
-            remaining -= bytes.len();
-            artifacts.push(json!({"path":path,"body":STANDARD.encode(bytes)}));
-        }
-    }
-    Ok(json!({"exit_code":code,"output_truncated":truncated,"artifacts":artifacts}))
+    Ok(json!({"exit_code":code,"output_truncated":truncated}))
 }
 
 pub fn prepare(work: &Work, root: &Path, source: Option<&mut dyn Read>) -> Result<(), Value> {

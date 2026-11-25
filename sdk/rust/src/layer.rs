@@ -15,7 +15,7 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
     hex_digest(Sha256::digest(bytes))
 }
 
-fn hex_digest(bytes: impl IntoIterator<Item = u8>) -> String {
+pub(crate) fn hex_digest(bytes: impl IntoIterator<Item = u8>) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut digest = String::with_capacity(71);
     digest.push_str("sha256:");

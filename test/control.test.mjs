@@ -126,7 +126,7 @@ test("lazy layers, idempotency, tenant isolation, replay, artifacts and cache ev
   await service.run(initial.task_id, runGuest);
 
   const terminal = await (await request(handler, initial.links.self)).json();
-  assert.equal(terminal.state, "SUCCEEDED");
+  assert.equal(terminal.state, "SUCCEEDED", JSON.stringify(terminal.result));
   assert.equal(terminal.result.exit_code, 0);
   const replay = await (await request(handler, initial.links.events, { headers: { "last-event-id": "1" } })).text();
   assert.doesNotMatch(replay, /task.accepted/);
@@ -227,7 +227,8 @@ test("client builds a workspace delta, caches its bytes, supplies layers and con
   const task = await client.submit(spec);
   const timer = setInterval(() => { void service.run(task.task_id, runGuest); }, 20);
   t.after(() => clearInterval(timer));
-  assert.equal((await client.wait(task.task_id, { pollMs: 20, signal: AbortSignal.timeout(5000) })).state, "SUCCEEDED");
+  const finished = await client.wait(task.task_id, { pollMs: 20, signal: AbortSignal.timeout(5000) });
+  assert.equal(finished.state, "SUCCEEDED", JSON.stringify(finished.result));
   assert.deepEqual(requested, [lower.digest, upper.digest]);
   const { artifacts } = await client.artifacts(task.task_id);
   assert.equal(await (await client.download(artifacts[0])).text(), "after");
@@ -340,7 +341,7 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
 
   const signal = AbortSignal.timeout(6000);
   const first = await runTaskFile(taskfile, { client, cache, requestId: "template-first", signal, onAccepted: (task) => { active = task; } });
-  assert.equal(first.task.state, "SUCCEEDED");
+  assert.equal(first.task.state, "SUCCEEDED", JSON.stringify(first.task.result));
   assert.equal(first.layers.length, 1);
   assert.equal(first.layers[0].id, "source");
   assert.equal(first.manifest.resources.timeout_s, 3);

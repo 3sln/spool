@@ -141,7 +141,7 @@ and event cursors are served by the runner.
 `submit_template` compiles a checked-in Taskfile under the workspace root.
 Call `wait_task` to satisfy layer requests from disk. Call `task_status` and
 `task_events` to inspect progress, then `extend_task` to request a later deadline. Use
-`task_artifacts` and `read_artifact` to retrieve results.
+`task_artifacts` and `read_artifact` to retrieve results up to 512 KiB through MCP. Use a client library for larger files.
 
 ## Cloudflare preview
 
@@ -184,11 +184,11 @@ Across hosts, use HTTPS for coordinator calls, a private authenticated TLS conne
 
 - [JSON Schema](protocol/manifest.schema.json), [OpenAPI](protocol/openapi.yaml), and [wire semantics](protocol/README.md).
 - The execution profile supports Linux/amd64 with a pinned Debian 12 base, a statically linked guest, and ordered USTAR or gzip changesets. Regular files, directories, the executable bit, whiteouts, and opaque directories are supported under `/workspace`. Archive links, PAX extensions, special files and extended attributes are outside the profile.
-- The runner offers a one-hour advisory cache lease and retains task history and idempotency for 24 hours after completion. Artifact downloads currently have a 512 KiB total per-task limit. Full-root composition, larger artifact transfers, warm reuse, and public multi-tenant hardening are separate gates.
+- The runner offers a one-hour advisory cache lease and retains task history and idempotency for 24 hours after completion. Declared outputs stream up to a combined 256 MiB per task by default. Set `SPOOL_MAX_ARTIFACT_MIB` to an integer from 0 to 1024 to adjust that budget. Use the JavaScript download response stream or Rust `download_to` to save large files. Full-root composition, warm reuse, and public multi-tenant hardening remain open.
 - `bb test` checks the HTTP runner, client cache and SDK, stdio MCP, SQLite, JWT verification and native guest. `bb test-worker` exercises the Worker and SQLite Durable Object in workerd with fixture blob and execution bindings. Set `SPOOL_TOOL_MODULES` to the directory containing the installed workerd and esbuild packages if they are outside the global npm root. `bb worker-check` generates an ignored test config and runs Wrangler’s dry-run build with Docker.
 
 ## Development and release
 
 Install Babashka and run `bb tasks` for development commands. Run `npm ci` to install dependencies, `bb test` for JavaScript and native guest tests, `bb test-rust` for the Rust SDK, and `bb test-oci` with a working Docker engine for the integration suite. Set `SPOOL_TEST_RUST=1` to include the Rust client against the same runner. The GitHub verification workflow also runs the Worker fixture, the JetStream worker pool, and tarball installation in a clean consumer.
 
-Run `SPOOL_RELEASE_OCI=1 bb release-build` to prepare and verify the complete release assets in `dist/`. The GitHub release workflow builds private artifacts by default and can stage a draft prerelease from main. See [development status](DEVLOG.md), [security scope](SECURITY.md), and the [MIT license](LICENSE).
+Run `SPOOL_RELEASE_OCI=1 bb release-build` to prepare and verify the complete release assets in `dist/`. The GitHub release workflow builds CI artifacts and can stage a draft prerelease from main. See [development status](DEVLOG.md), [security scope](SECURITY.md), and the [MIT license](LICENSE).

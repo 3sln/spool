@@ -1,4 +1,4 @@
-import { canonical, Fault, json, LIMITS, readBytes, sha256, terminal, validateManifest } from "./contract.mjs";
+import { canonical, digestPattern, Fault, json, LIMITS, readBytes, sha256, terminal, validateManifest } from "./contract.mjs";
 
 const seconds = (value) => value * 1000;
 const taskKey = (id) => `task/${id}`;
@@ -41,7 +41,7 @@ export class TaskService {
   #tail = Promise.resolve();
   #running = new Map();
 
-  constructor(store, blobs, { wake = async () => {}, stop = async () => {}, concurrency = 1, limits = LIMITS, transfers } = {}) {
+  constructor(store, blobs, { wake = async () => {}, stop = async () => {}, concurrency = 1, limits = LIMITS, transfers, artifactStorage } = {}) {
     this.store = store;
     this.blobs = blobs;
     this.wake = wake;
@@ -49,6 +49,7 @@ export class TaskService {
     this.limits = limits;
     this.concurrency = concurrency;
     this.transfers = transfers;
+    this.artifactStorage = artifactStorage;
   }
 
   // Persist each transition and its indexes atomically. Executors run outside this queue.
@@ -448,12 +449,57 @@ export class TaskService {
 
   async artifact(tenant, id, index) {
     const job = await this.locked(() => this.find(id, tenant));
-    const artifacts = job.artifacts.map(({ body, ...metadata }) => metadata);
+    const artifacts = job.artifacts.map(({ body, storage, ...metadata }) => metadata);
     if (index === undefined) return json({ artifacts });
     const artifact = job.artifacts[index];
     if (!artifact) throw new Fault("NOT_FOUND", "Artifact not found", 404);
-    return new Response(Uint8Array.from(atob(artifact.body), (character) => character.charCodeAt(0)), {
-      headers: { "content-type": "application/octet-stream", "content-disposition": "attachment", "x-content-type-options": "nosniff", "cache-control": "no-store" },
+    const body = artifact.storage ? await this.artifactStorage?.open(artifact.storage)
+      : Uint8Array.from(atob(artifact.body), (character) => character.charCodeAt(0));
+    if (!body) throw new Fault("NOT_FOUND", "Artifact bytes not found", 404);
+    return new Response(body, {
+      headers: { "content-type": "application/octet-stream", "content-length": String(artifact.size),
+        "content-disposition": "attachment", "x-content-type-options": "nosniff", "cache-control": "no-store" },
+    });
+  }
+
+  async stageArtifact(id, claim, metadata, request) {
+    const { path, size, digest } = metadata ?? {};
+    const staged = await this.locked(async () => {
+      const job = await this.store.get(taskKey(id));
+      if (!this.artifactStorage || job?.state !== "RUNNING" || job.claim !== claim || job.deadline <= Date.now()) {
+        throw new Fault("NOT_FOUND", "Active execution claim not found", 404);
+      }
+      const index = job.manifest.outputs?.paths.indexOf(path) ?? -1;
+      if (index < 0 || !Number.isSafeInteger(size) || size < 0 || typeof digest !== "string" || !digestPattern.test(digest)) {
+        throw new Fault("RESOURCE_LIMIT", "Invalid artifact descriptor", 422);
+      }
+      job.stagedArtifacts ??= {};
+      const existing = job.stagedArtifacts[index];
+      if (existing) {
+        if (existing.size !== size || existing.digest !== digest) throw new Fault("RESOURCE_LIMIT", "Conflicting artifact descriptor", 409);
+        return existing;
+      }
+      const total = Object.values(job.stagedArtifacts).reduce((sum, artifact) => sum + artifact.size, size);
+      if (total > this.limits.max_artifact_bytes_total) throw new Fault("RESOURCE_LIMIT", "Artifact budget exceeded", 413);
+      const stage = { path, size, digest, storage: `artifacts/${job.tenant}/${id}/${claim}/${index}` };
+      job.stagedArtifacts[index] = stage;
+      await this.save(job);
+      return stage;
+    });
+    if (staged.ready) {
+      await request.body?.cancel();
+      return;
+    }
+    await this.artifactStorage.putVerified(staged.storage, request, staged);
+    await this.locked(async () => {
+      const job = await this.store.get(taskKey(id));
+      if (job?.state !== "RUNNING" || job.claim !== claim || job.deadline <= Date.now()) {
+        if (!job?.artifacts.some(({ storage }) => storage === staged.storage)) await this.artifactStorage.delete(staged.storage);
+        throw new Fault("NOT_FOUND", "Active execution claim not found", 404);
+      }
+      const descriptor = Object.values(job.stagedArtifacts).find(({ storage }) => storage === staged.storage);
+      descriptor.ready = true;
+      await this.save(job);
     });
   }
 
@@ -476,7 +522,11 @@ export class TaskService {
         await this.store.commit({}, [key]);
       }
       for (const [key, expires] of await this.store.list("history/")) {
-        if (expires <= current) await this.store.commit({}, [key, taskKey(key.slice(8))]);
+        if (expires > current) continue;
+        const jobKey = taskKey(key.slice(8));
+        const job = await this.store.get(jobKey);
+        for (const artifact of Object.values(job?.stagedArtifacts ?? {})) await this.artifactStorage?.delete(artifact.storage);
+        await this.store.commit({}, [key, jobKey]);
       }
       return queued.sort((first, second) => first.created_at.localeCompare(second.created_at)).map(({ id, queue_epoch }) => ({ id, epoch: queue_epoch }));
     });
@@ -526,7 +576,8 @@ export class TaskService {
       event(job, "task.started", { attempt: 1 });
       await this.save(job);
       const manifest = { ...job.manifest, resources: { ...job.manifest.resources, timeout_s: commandTimeout } };
-      return { claim: job.claim, expires: Math.min(job.hardDeadline, job.executionLimit), manifest };
+      return { claim: job.claim, expires: Math.min(job.hardDeadline, job.executionLimit), manifest,
+        ...(this.artifactStorage ? { artifact_limit: this.limits.max_artifact_bytes_total } : {}) };
     });
   }
 
@@ -557,8 +608,17 @@ export class TaskService {
         result = { error: "SANDBOX_FAILURE" };
       }
       const paths = job.manifest.outputs?.paths ?? [];
-      let remaining = LIMITS.max_artifact_bytes_total;
+      let remaining = Math.min(512 * 1024, this.limits.max_artifact_bytes_total);
       const artifacts = Array.isArray(result.artifacts) ? result.artifacts.slice(0, paths.length) : [];
+      if (!result.error || result.error === "EXECUTION_FAILED") {
+        for (const { ready, storage, ...metadata } of Object.values(job.stagedArtifacts ?? {})) {
+          if (!ready) continue;
+          const artifact = { ...metadata, media_type: "application/octet-stream",
+            url: `/v1/tasks/${job.id}/artifacts/${job.artifacts.length}` };
+          event(job, "artifact.ready", artifact);
+          job.artifacts.push({ ...artifact, storage });
+        }
+      }
       for (const raw of artifacts) {
         if (!paths.includes(raw?.path) || job.artifacts.some(({ path }) => path === raw.path)
           || typeof raw.body !== "string" || raw.body.length > Math.ceil(remaining / 3) * 4) continue;
@@ -613,7 +673,8 @@ export class TaskService {
         let result;
         try {
           result = await executor(work, controller.signal, id, (chunk) => this.log(id, work.claim, chunk),
-            (index) => this.executionLayer(id, work.claim, index));
+            (index) => this.executionLayer(id, work.claim, index),
+            (artifact, body) => this.stageArtifact(id, work.claim, artifact, { body, signal: controller.signal }));
         }
         catch (error) {
           if (!controller.signal.aborted) console.error("Executor failed", id, error.message);

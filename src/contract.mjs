@@ -12,7 +12,7 @@ const MIB = 1024 ** 2;
 export const LIMITS = {
   max_layers: 16, max_layer_bytes: 512 * MIB, max_input_bytes: 2048 * MIB, workspace_mib: 4096,
   max_job_seconds: 604800, max_task_seconds: 604800, wait_seconds: 1800, start_budget_seconds: 600,
-  max_logs_bytes: 128 * 1024, max_log_events: 1024, max_artifact_bytes_total: 512 * 1024,
+  max_logs_bytes: 128 * 1024, max_log_events: 1024, max_artifact_bytes_total: 256 * MIB,
   max_manifest_bytes: 32 * 1024, max_active_tasks_per_tenant: 16,
   max_output_paths: 8, cache_ttl_seconds: 3600, history_ttl_seconds: 86400,
 };
@@ -45,6 +45,7 @@ export function configuredLimits(env, { layerCeiling = 2048, defaultLayer = 512,
     workspace_mib: setting("SPOOL_WORKSPACE_MIB", LIMITS.workspace_mib, 64, 8192),
     wait_seconds: setting("SPOOL_ADMISSION_SECONDS", LIMITS.wait_seconds, 1, 86400),
     start_budget_seconds: setting("SPOOL_STARTUP_SECONDS", LIMITS.start_budget_seconds, 1, 600),
+    max_artifact_bytes_total: setting("SPOOL_MAX_ARTIFACT_MIB", 256, 0, 1024) * MIB,
   };
 }
 

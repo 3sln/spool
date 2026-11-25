@@ -1,5 +1,8 @@
 node_modules/
 .wrangler/
+/wrangler.json
+/wrangler.jsonc
+/wrangler.toml
 .dev.vars*
 .env*
 .spool/

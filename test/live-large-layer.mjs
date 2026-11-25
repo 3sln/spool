@@ -32,8 +32,8 @@ try {
     protocol_version: "0.1", client_request_id: crypto.randomUUID(), task_timeout_s: 180,
     platform: { os: "linux", arch: "amd64" },
     environment: { base: info.bases[0], layers: [descriptor] },
-    command: { argv: ["sh", "-ec", "stat -c %s training.dat > result"], cwd: "/workspace" },
-    resources: info.resource_profile, network: { mode: "none" }, outputs: { paths: ["/workspace/result"] },
+    command: { argv: ["sh", "-ec", "stat -c %s training.dat > result; head -c 1048576 training.dat > checkpoint"], cwd: "/workspace" },
+    resources: info.resource_profile, network: { mode: "none" }, outputs: { paths: ["/workspace/result", "/workspace/checkpoint"] },
   };
   await assert.rejects(client.submit({ ...manifest, environment: { ...manifest.environment,
     layers: [{ ...descriptor, size: info.limits.max_layer_bytes + 1 }] } }, { signal }), { status: 413 });
@@ -44,6 +44,11 @@ try {
   assert.equal(result.state, "SUCCEEDED", JSON.stringify(result));
   const { artifacts } = await client.artifacts(task.task_id, { signal });
   assert.equal((await (await client.download(artifacts[0], { signal })).text()).trim(), String(size));
+  const checkpoint = artifacts.find(({ path }) => path === "/workspace/checkpoint");
+  const download = await client.download(checkpoint, { signal });
+  assert.equal(checkpoint.size, 1048576);
+  assert.equal(download.headers.get("content-length"), String(checkpoint.size));
+  assert.equal((await download.arrayBuffer()).byteLength, checkpoint.size);
   console.log(`Streamed ${descriptor.size} bytes from disk cache into the offline OCI guest`);
 } finally {
   await runner?.close();
