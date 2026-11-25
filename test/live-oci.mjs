@@ -36,15 +36,17 @@ try {
   assert.equal((await fetch(new URL("/v1/tasks", url), {method:"POST",body:"{}",signal})).status, 401);
   const capabilities = await client.capabilities({ signal });
   const manifest = {
-    protocol_version: "0.1", client_request_id: nonce, platform: { os: "linux", arch: "amd64" },
+    protocol_version: "0.1", task_timeout_s: 180, client_request_id: nonce, platform: { os: "linux", arch: "amd64" },
     environment: { base: capabilities.bases[0], layers },
     command: {
       argv: ["sh", "-ec", `test ! -e obsolete.txt
 test ! -e opaque/old.txt
+${local ? "if grep -q '[[:space:]]00000000[[:space:]]' /proc/net/route; then exit 1; fi; grep -q 'lo:' /proc/net/dev" : ":"}
 test ! -e /tmp/spool-probe-reuse-marker
 touch /tmp/spool-probe-reuse-marker
 cat value.txt unaffected.txt opaque/new.txt > result.txt
 cat result.txt
+sleep 2
 uname -m
 id -u`], cwd: "/workspace",
     },
@@ -58,9 +60,17 @@ id -u`], cwd: "/workspace",
     if (iteration === 1) assert.deepEqual(submitted.required, layers);
     else assert.equal(submitted.required.length, 0);
     console.log(JSON.stringify({ iteration, task_id: submitted.task_id, state: submitted.state, missing: submitted.required.length }));
-    const task = await client.wait(submitted.task_id, { signal });
+    const waiting = client.wait(submitted.task_id, { signal });
     const trace = [];
-    for await (const event of client.events(task.task_id, { signal })) trace.push(event);
+    let sawLiveLog = false;
+    for await (const event of client.events(submitted.task_id, { signal })) {
+      if (event.type === "task.stdout" && event.data.text.includes("replacement") && !sawLiveLog) {
+        sawLiveLog = (await client.status(submitted.task_id, { signal })).state === "RUNNING";
+      }
+      trace.push(event);
+    }
+    const task = await waiting;
+    assert.equal(sawLiveLog, true, "Command output should be visible during execution");
     assert.equal(task.state, "SUCCEEDED", JSON.stringify({task,trace}));
     const artifacts = (await client.artifacts(task.task_id, { signal })).artifacts;
     assert.equal(artifacts.length, 1);

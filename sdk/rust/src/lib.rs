@@ -3,19 +3,21 @@ mod layer;
 #[allow(clippy::needless_return)]
 mod replay;
 
-pub use layer::{Entry, LayerCache, TAR, TAR_GZIP, build_layer, describe};
+pub use layer::{Entry, LayerCache, TAR, TAR_GZIP, build_layer, describe, describe_reader};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
+    collections::{BTreeMap, HashSet},
     error::Error as StdError,
     fmt::{self, Display},
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    path::Path,
     thread,
     time::{Duration, Instant},
 };
 pub use ureq::http::{HeaderMap, HeaderValue};
 use ureq::{
-    Agent, Body,
+    Agent, AsSendBody, Body, SendBody,
     http::{Request, Response},
 };
 use url::Url;
@@ -82,7 +84,13 @@ pub struct Task {
     pub task_id: String,
     pub state: String,
     pub cursor: i64,
+    pub deadline: String,
+    pub task_deadline: String,
+    pub hard_deadline: String,
+    pub execution_deadline_limit: Option<String>,
     pub required: Vec<Descriptor>,
+    #[serde(default)]
+    pub upload_plans: BTreeMap<String, Value>,
     pub result: Option<Value>,
 }
 impl Task {
@@ -109,10 +117,20 @@ pub struct Event {
     pub data: Value,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EventPage {
+    pub events: Vec<Event>,
+    pub next_cursor: i64,
+    pub terminal: bool,
+    pub has_more: bool,
+}
+
 pub struct Client {
     base: Url,
     agent: Agent,
+    transfer_agent: Agent,
     headers: Box<dyn Fn() -> Result<HeaderMap> + Send + Sync>,
+    transfer_origins: HashSet<String>,
 }
 impl Client {
     /// Resolve per-request headers with this callback, including refreshed credentials.
@@ -136,19 +154,44 @@ impl Client {
             .timeout_global(Some(Duration::from_secs(30)))
             .build()
             .into();
+        let transfer_agent = Agent::config_builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(1800)))
+            .build()
+            .into();
         Ok(Self {
             base,
             agent,
+            transfer_agent,
             headers: Box::new(headers),
+            transfer_origins: HashSet::new(),
         })
+    }
+
+    /// Permit anonymous, signed transfers to this explicit HTTPS origin.
+    pub fn with_transfer_origin(mut self, origin: &str) -> Result<Self> {
+        let url = Url::parse(origin).map_err(|_| Error::Invalid("Invalid transfer origin"))?;
+        if url.scheme() != "https"
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(Error::Invalid("Expected an HTTPS transfer origin"));
+        }
+        self.transfer_origins
+            .insert(url.origin().ascii_serialization());
+        Ok(self)
     }
 
     fn request(
         &self,
         method: &str,
         path: &str,
-        bytes: &[u8],
-        content: Option<&str>,
+        bytes: impl AsSendBody,
+        content: Option<(&str, Option<usize>)>,
         cursor: Option<i64>,
         authenticated: bool,
     ) -> Result<Response<Body>> {
@@ -156,7 +199,12 @@ impl Client {
             .base
             .join(path)
             .map_err(|_| Error::Invalid("Invalid runner response URL"))?;
-        if url.origin() != self.base.origin()
+        if (url.origin() != self.base.origin()
+            && (authenticated
+                || url.scheme() != "https"
+                || !self
+                    .transfer_origins
+                    .contains(&url.origin().ascii_serialization())))
             || !url.username().is_empty()
             || url.password().is_some()
         {
@@ -168,15 +216,23 @@ impl Client {
                 request = request.header(name, value);
             }
         }
-        if let Some(content) = content {
+        if let Some((content, length)) = content {
             request = request.header("content-type", content);
+            if let Some(length) = length {
+                request = request.header("content-length", length.to_string());
+            }
         }
         if let Some(cursor) = cursor {
             request = request
                 .header("accept", "text/event-stream")
                 .header("last-event-id", cursor.to_string());
         }
-        let mut response = self.agent.run(
+        let agent = if method == "PUT" || url.path().ends_with("/complete") {
+            &self.transfer_agent
+        } else {
+            &self.agent
+        };
+        let mut response = agent.run(
             request
                 .body(bytes)
                 .map_err(|_| Error::Invalid("Invalid HTTP request"))?,
@@ -205,8 +261,8 @@ impl Client {
             self.request(
                 method,
                 path,
-                body.unwrap_or(&[]),
-                body.map(|_| "application/json"),
+                body.unwrap_or(&[][..]),
+                body.map(|_| ("application/json", None)),
                 None,
                 true,
             )?
@@ -234,6 +290,28 @@ impl Client {
         retry(|| self.json("GET", &path, None))
     }
 
+    pub fn extend(&self, id: &str, task_timeout_s: u64) -> Result<Task> {
+        if task_timeout_s == 0 {
+            return Err(Error::Invalid(
+                "Supply positive total seconds since submission",
+            ));
+        }
+        let path = format!("{}/extend", task_path(id)?);
+        let bytes = serde_json::to_vec(&serde_json::json!({ "task_timeout_s": task_timeout_s }))?;
+        retry(|| self.json("POST", &path, Some(&bytes)))
+    }
+
+    pub fn event_page(&self, id: &str, cursor: i64, limit: u8) -> Result<EventPage> {
+        if !(0..=9_007_199_254_740_991).contains(&cursor) || !(1..=100).contains(&limit) {
+            return Err(Error::Invalid("Invalid page cursor or limit"));
+        }
+        self.json(
+            "GET",
+            &format!("{}/events?cursor={cursor}&limit={limit}", task_path(id)?),
+            None,
+        )
+    }
+
     pub fn cancel(&self, id: &str) -> Result<Task> {
         self.json("POST", &format!("{}/cancel", task_path(id)?), None)
     }
@@ -242,28 +320,109 @@ impl Client {
         if &describe(bytes, &layer.media_type)? != layer {
             return Err(Error::Invalid("Layer bytes do not match the descriptor"));
         }
-        #[derive(Deserialize)]
-        struct Offer {
-            method: String,
-            url: String,
-            authenticated: bool,
-        }
-        let path = format!("{}/layers/{}/upload", task_path(id)?, layer.digest);
-        retry(|| {
-            let offer: Offer = self.json("POST", &path, None)?;
-            if offer.method != "PUT" {
-                return Err(Error::Invalid("Runner did not offer a PUT transfer"));
-            }
+        self.upload_with(id, layer, |url, offset, size, authenticated| {
             self.request(
                 "PUT",
-                &offer.url,
-                bytes,
-                Some("application/octet-stream"),
+                url,
+                &bytes[offset..offset + size],
+                Some(("application/octet-stream", None)),
                 None,
-                offer.authenticated,
-            )?;
-            Ok(())
+                authenticated,
+            )
         })
+    }
+
+    /// Upload a prepared layer from a local file without buffering it in memory.
+    pub fn upload_file(&self, id: &str, layer: &Descriptor, path: impl AsRef<Path>) -> Result<()> {
+        let mut file = std::fs::File::open(path)?;
+        if !file.metadata()?.is_file()
+            || layer::describe_reader(&mut file, &layer.media_type, layer.size)? != *layer
+        {
+            return Err(Error::Invalid("Layer file does not match the descriptor"));
+        }
+        self.upload_with(id, layer, |url, offset, size, authenticated| {
+            file.seek(SeekFrom::Start(offset as u64))?;
+            let mut part = (&mut file).take(size as u64);
+            self.request(
+                "PUT",
+                url,
+                SendBody::from_reader(&mut part),
+                Some(("application/octet-stream", Some(size))),
+                None,
+                authenticated,
+            )
+        })
+    }
+
+    fn upload_with(
+        &self,
+        id: &str,
+        layer: &Descriptor,
+        mut send_part: impl FnMut(&str, usize, usize, bool) -> Result<Response<Body>>,
+    ) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Part {
+            number: usize,
+            offset: usize,
+            size: usize,
+            url: String,
+        }
+        #[derive(Deserialize)]
+        struct Offer {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            method: String,
+            url: Option<String>,
+            authenticated: bool,
+            max_size: Option<usize>,
+            #[serde(default)]
+            parts: Vec<Part>,
+            complete_url: Option<String>,
+        }
+        let path = format!("{}/layers/{}/upload", task_path(id)?, layer.digest);
+        let offer: Offer = retry(|| self.json("POST", &path, None))?;
+        if offer.method != "PUT" || offer.max_size.is_some_and(|size| size < layer.size) {
+            return Err(Error::Invalid(
+                "Runner did not offer a compatible PUT transfer",
+            ));
+        }
+        let mut put =
+            |url: &str, offset, size| retry(|| send_part(url, offset, size, offer.authenticated));
+        let mut parts = Vec::new();
+        if offer.kind.as_deref() == Some("presigned-multipart") {
+            let mut offset: usize = 0;
+            for (index, part) in offer.parts.iter().enumerate() {
+                let end = offset
+                    .checked_add(part.size)
+                    .filter(|end| *end <= layer.size)
+                    .ok_or(Error::Invalid("Invalid upload part range"))?;
+                if part.number != index + 1 || part.offset != offset || part.size == 0 {
+                    return Err(Error::Invalid("Invalid upload part range"));
+                }
+                let response = put(&part.url, offset, part.size)?;
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or(Error::Invalid("Storage did not return a part ETag"))?;
+                parts.push(serde_json::json!({ "number": part.number, "etag": etag }));
+                offset = end;
+            }
+            if offset != layer.size || offer.complete_url.is_none() {
+                return Err(Error::Invalid("Incomplete multipart upload plan"));
+            }
+        } else {
+            let url = offer
+                .url
+                .as_deref()
+                .ok_or(Error::Invalid("Runner returned no upload URL"))?;
+            put(url, 0, layer.size)?;
+        }
+        if let Some(url) = offer.complete_url {
+            let body = serde_json::to_vec(&serde_json::json!({ "parts": parts }))?;
+            let _: Value = retry(|| self.json("POST", &url, Some(&body)))?;
+        }
+        Ok(())
     }
 
     /// Supply requested layers and wait for a terminal state. The timeout is for this local wait.
@@ -321,7 +480,7 @@ impl Client {
             return Err(Error::Invalid("Artifact exceeds the client limit"));
         }
         let mut bytes = Vec::new();
-        self.request("GET", &artifact.url, &[], None, None, true)?
+        self.request("GET", &artifact.url, &[][..], None, None, true)?
             .body_mut()
             .as_reader()
             .take(artifact.size as u64 + 1)
@@ -340,7 +499,7 @@ impl Client {
         let response = self.request(
             "GET",
             &format!("{}/events", task_path(id)?),
-            &[],
+            &[][..],
             None,
             Some(cursor),
             true,

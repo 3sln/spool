@@ -1,21 +1,23 @@
 import { createServer } from "node:http";
-import { mkdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 import { publicEndpoint, taskEndpoint } from "./api.mjs";
 import { bearer, configuredAuth, staticToken } from "./auth.mjs";
-import { json, readJSON, taskPattern } from "./contract.mjs";
+import { configuredLimits, json, readJSON, taskPattern } from "./contract.mjs";
 import { EXECUTION, ociExecutor } from "./oci.mjs";
 import { connectQueue } from "./jetstream.mjs";
 import { TaskService } from "./service.mjs";
 import { openData } from "./sqlite.mjs";
+import { fileBlobs } from "./file-blobs.mjs";
 
 export function nodeHandler(service, auth, { origins = [], workerAuth } = {}) {
   const publicAPI = publicEndpoint(auth, origins, EXECUTION, (request, tenant) => {
     return taskEndpoint(request, tenant, service);
-  });
+  }, service.limits);
   return async (request) => {
     const path = new URL(request.url).pathname;
     if (!path.startsWith("/internal/")) return publicAPI(request);
@@ -24,12 +26,18 @@ export function nodeHandler(service, auth, { origins = [], workerAuth } = {}) {
     const [, , id, action, ...rest] = path.split("/");
     if (request.method !== "POST" || rest.length || !taskPattern.test(id ?? "")) return json({ error: "NOT_FOUND" }, 404);
     try {
-      const body = await readJSON(request, action === "finish" ? 2 * 1024 ** 2 : 1024);
+      const body = await readJSON(request, action === "finish" ? 2 * 1024 ** 2 : action === "log" ? 32 * 1024 : 1024);
       if (action === "claim" && typeof body?.epoch === "string") {
         const work = await service.claim(id, body.epoch);
         return work ? json(work) : new Response(null, { status: 204 });
       }
       if (action === "live") return json({ live: await service.liveClaim(id, body?.claim) });
+      if (action === "layer" && Number.isSafeInteger(body?.index)) {
+        const contents = await service.executionLayer(id, body.claim, body.index);
+        return contents ? new Response(contents, { headers: { "content-type": "application/octet-stream" } })
+          : new Response(null, { status: 404 });
+      }
+      if (action === "log") return json({ accepted: await service.log(id, body?.claim, body?.chunk) });
       if (action === "finish") return json({ accepted: await service.finish(id, body?.claim, body?.result) });
       return json({ error: "NOT_FOUND" }, 404);
     } catch (error) {
@@ -40,6 +48,8 @@ export function nodeHandler(service, auth, { origins = [], workerAuth } = {}) {
 
 export async function start(env = process.env, overrides = {}) {
   const auth = overrides.auth ?? configuredAuth(env);
+  const objectStorage = env.SPOOL_S3_BUCKET ? await (await import("./s3-storage.mjs")).s3Storage(env) : undefined;
+  const limits = configuredLimits(env, objectStorage ? { uploads: ["presigned-put", "presigned-multipart"] } : undefined);
   const workers = Number(env.SPOOL_CONCURRENCY ?? 1);
   const port = Number(env.PORT ?? 8787);
   if (!Number.isInteger(workers) || workers < 1 || workers > 64) throw new Error("Invalid SPOOL_CONCURRENCY");
@@ -52,7 +62,9 @@ export async function start(env = process.env, overrides = {}) {
   const workerAuth = env.SPOOL_NATS_URL ? staticToken(env.SPOOL_WORKER_TOKEN) : undefined;
   const queue = env.SPOOL_NATS_URL ? await connectQueue(env, true) : undefined;
   const data = openData(file);
-  const service = new TaskService(data.store, data.blobs, { concurrency: workers });
+  const temporary = file === ":memory:" && !objectStorage ? await mkdtemp(`${tmpdir()}/spool-blobs-`) : undefined;
+  const blobs = objectStorage?.blobs ?? fileBlobs(temporary ?? `${file}.layers`, data.blobs);
+  const service = new TaskService(data.store, blobs, { concurrency: workers, limits, transfers: objectStorage?.transfers });
   const handler = nodeHandler(service, auth, { origins: env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], workerAuth });
   const executor = overrides.executor ?? ociExecutor(env);
   const active = new Map();
@@ -104,6 +116,7 @@ export async function start(env = process.env, overrides = {}) {
       console.error("HTTP bridge:", error.message);
     }
   });
+  server.requestTimeout = limits.wait_seconds * 1000;
 
   try {
     await new Promise((resolve, reject) => {
@@ -113,6 +126,7 @@ export async function start(env = process.env, overrides = {}) {
   } catch (error) {
     await queue?.close();
     data.close();
+    if (temporary) await rm(temporary, { recursive: true, force: true });
     throw error;
   }
   const timer = setInterval(() => void tick(), 750);
@@ -130,6 +144,7 @@ export async function start(env = process.env, overrides = {}) {
       while (scheduling) await new Promise((resolve) => setTimeout(resolve, 25));
       await Promise.allSettled(active.values());
       data.close();
+      if (temporary) await rm(temporary, { recursive: true, force: true });
     },
   };
 }

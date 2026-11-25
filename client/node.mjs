@@ -1,7 +1,11 @@
-import { constants } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants, createWriteStream, openAsBlob } from "node:fs";
 import { lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import { resolve, join } from "node:path";
-import { buildLayer, DEFAULT_LAYER_LIMIT, layerDescriptor, TAR } from "./layers.mjs";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { buildLayer, DEFAULT_LAYER_LIMIT, layerDescriptor, TAR, TAR_GZIP } from "./layers.mjs";
+import { resolveBuild } from "./build-cache.mjs";
 
 function keyFor(digest) {
   if (typeof digest !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(digest)) throw new TypeError("Invalid layer digest");
@@ -25,11 +29,54 @@ async function boundedFile(path, size) {
   } finally { await file.close(); }
 }
 
-export async function openLayerCache(directory, { maxLayerBytes = DEFAULT_LAYER_LIMIT } = {}) {
+export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3 } = {}) {
   const root = resolve(directory);
   await mkdir(root, { recursive: true, mode: 0o700 });
   const layerPath = (digest) => join(root, keyFor(digest));
-  return {
+  async function openRegular(path, maximum) {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.size < 1 || info.size > maximum) throw new RangeError("Expected a layer file within the byte limit");
+      return { file, size: info.size };
+    } catch (error) {
+      await file.close();
+      throw error;
+    }
+  }
+  function layerSize(descriptor) {
+    if (!Number.isSafeInteger(descriptor.size) || descriptor.size < 1 || descriptor.size > maxLayerBytes) {
+      throw new RangeError("Layer descriptor exceeds the cache limit");
+    }
+    return descriptor.size;
+  }
+  async function scan(file, size, signal, destination) {
+    const hash = createHash("sha256");
+    let consumed = 0;
+    const input = file.createReadStream({ autoClose: false });
+    const verify = (chunk) => {
+      consumed += chunk.length;
+      if (consumed > size) throw new Error("Layer grew while it was being read");
+      hash.update(chunk);
+    };
+    if (destination) {
+      const transform = new Transform({
+        transform(chunk, _encoding, done) {
+          try { verify(chunk); done(null, chunk); }
+          catch (error) { done(error); }
+        },
+      });
+      await pipeline(input, transform, createWriteStream(destination, { flags: "wx", mode: 0o600 }), { signal });
+    } else {
+      for await (const chunk of input) {
+        signal?.throwIfAborted();
+        verify(chunk);
+      }
+    }
+    if (consumed !== size) throw new Error("Layer changed while it was being read");
+    return `sha256:${hash.digest("hex")}`;
+  }
+  const cache = {
     async put(bytes, mediaType = TAR) {
       if (!(bytes instanceof Uint8Array)) throw new TypeError("Expected Uint8Array layer bytes");
       if (bytes.length > maxLayerBytes) throw new RangeError("Layer exceeds the cache limit");
@@ -50,10 +97,7 @@ export async function openLayerCache(directory, { maxLayerBytes = DEFAULT_LAYER_
     async source(descriptor, { signal } = {}) {
       signal?.throwIfAborted();
       const path = layerPath(descriptor.digest);
-      if (!Number.isSafeInteger(descriptor.size) || descriptor.size < 1 || descriptor.size > maxLayerBytes) {
-        throw new RangeError("Layer descriptor exceeds the cache limit");
-      }
-      const found = await boundedFile(path, descriptor.size).catch((error) => {
+      const found = await boundedFile(path, layerSize(descriptor)).catch((error) => {
         if (error.code === "ENOENT") return undefined;
         throw error;
       });
@@ -64,11 +108,63 @@ export async function openLayerCache(directory, { maxLayerBytes = DEFAULT_LAYER_
       }
       return found.bytes;
     },
+    async open(descriptor, { signal } = {}) {
+      const path = layerPath(descriptor.digest);
+      const entry = await openRegular(path, layerSize(descriptor)).catch((error) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (!entry) return undefined;
+      try {
+        if (entry.size !== descriptor.size || await scan(entry.file, entry.size, signal) !== descriptor.digest) {
+          throw new Error(`Layer cache integrity check failed for ${descriptor.digest}`);
+        }
+        return process.versions.bun ? Bun.file(path) : await openAsBlob(path);
+      } finally {
+        await entry.file.close();
+      }
+    },
+    async importFile(path, mediaType = TAR, { maxBytes = maxLayerBytes, signal } = {}) {
+      if (![TAR, TAR_GZIP].includes(mediaType)) throw new TypeError("Expected an OCI tar media type");
+      const entry = await openRegular(path, Math.min(maxBytes, maxLayerBytes));
+      const temporary = join(root, `.${crypto.randomUUID()}.tmp`);
+      try {
+        const digest = await scan(entry.file, entry.size, signal, temporary);
+        const written = await open(temporary, "r");
+        try { await written.sync(); } finally { await written.close(); }
+        await rename(temporary, layerPath(digest));
+        return { digest, size: entry.size, media_type: mediaType };
+      } finally {
+        await entry.file.close();
+        await rm(temporary, { force: true });
+      }
+    },
+    async resolveBuild(buildKey, build, { signal } = {}) {
+      const key = keyFor(buildKey);
+      const index = join(root, ".builds");
+      await mkdir(index, { recursive: true, mode: 0o700 });
+      return resolveBuild(join(index, key + ".sqlite"),
+        (descriptor) => cache.source(descriptor, { signal }),
+        async () => {
+          const { bytes, mediaType } = await build();
+          return cache.put(bytes, mediaType);
+        }, signal);
+    },
+    async buildDirectory(directory, options = {}) {
+      const prepared = await planDirectoryLayer(directory, options);
+      const key = buildKey(["directory", 1, prepared.fingerprint()]);
+      return cache.resolveBuild(key, () => ({ bytes: prepared.build(), mediaType: TAR }), options);
+    },
     async list() {
       return (await readdir(root)).filter((name) => /^[a-f0-9]{64}$/u.test(name)).sort().map((name) => `sha256:${name}`);
     },
     async delete(digest) { await rm(layerPath(digest), { force: true }); },
   };
+  return cache;
+}
+
+export function buildKey(inputs) {
+  return `sha256:${createHash("sha256").update(JSON.stringify(inputs)).digest("hex")}`;
 }
 
 async function snapshot(root, { maxBytes, include, signal }) {
@@ -99,14 +195,13 @@ async function snapshot(root, { maxBytes, include, signal }) {
   return entries;
 }
 
-export async function buildDirectoryLayer(directory, {
+export async function planDirectoryLayer(directory, {
   previous, maxBytes = DEFAULT_LAYER_LIMIT, snapshotBytes = 32 * 1024 ** 2,
   include = () => true, signal,
 } = {}) {
   const options = { maxBytes: snapshotBytes, include, signal };
   const current = await snapshot(resolve(directory), options);
-  if (!previous) return buildLayer(current.values(), { maxBytes });
-  const prior = await snapshot(resolve(previous), options);
+  const prior = previous ? await snapshot(resolve(previous), options) : new Map();
   const delta = [];
   const removed = new Set();
   for (const [path, entry] of prior) {
@@ -121,5 +216,17 @@ export async function buildDirectoryLayer(directory, {
     if (entry.kind !== before?.kind || (entry.kind === "file"
       && (entry.executable !== before.executable || !entry.bytes.equals(before.bytes)))) delta.push(entry);
   }
-  return buildLayer(delta, { maxBytes });
+  return {
+    build: () => buildLayer(delta, { maxBytes }),
+    fingerprint() {
+      return buildKey(delta.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : a.kind.localeCompare(b.kind))
+        .map(({ kind, path, executable, bytes }) => kind === "file"
+          ? [kind, path, executable, bytes.length, createHash("sha256").update(bytes).digest("hex")]
+          : [kind, path]));
+    },
+  };
+}
+
+export async function buildDirectoryLayer(directory, options) {
+  return (await planDirectoryLayer(directory, options)).build();
 }

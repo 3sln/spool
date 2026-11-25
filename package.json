@@ -9,18 +9,18 @@
   "scripts": {
     "start": "node src/node.mjs",
     "agent": "node src/agent.mjs",
-    "test": "node --test test/*.test.mjs",
+    "test": "bb test",
     "guest:build": "node bin/runner.mjs guest-build",
     "worker:check": "wrangler deploy --dry-run --outdir .wrangler/build",
     "smoke": "node bin/smoke.mjs",
-    "test:worker": "sh bin/test-worker.sh",
+    "test:worker": "bb test-worker",
     "mcp": "node bin/mcp.mjs",
-    "client:emit": "sh bin/emit-client.sh",
+    "client:emit": "bb client-emit",
     "release:pack": "node release/package.mjs",
     "release:check": "node release/check.mjs",
-    "release:build": "sh release/build.sh",
-    "test:oci": "node test/live-oci.mjs",
-    "test:cluster": "node test/live-cluster.mjs"
+    "release:build": "bb release-build",
+    "test:oci": "bb test-oci",
+    "test:cluster": "bb test-cluster"
   },
   "optionalDependencies": {
     "@nats-io/jetstream": "3.4.0",
@@ -35,5 +35,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/3sln/spool.git"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1178.0",
+    "aws4fetch": "1.0.20"
   }
 }

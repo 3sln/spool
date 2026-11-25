@@ -1,14 +1,15 @@
 {
   "version": "0.1",
   "kind": "base",
+  "task_timeout_s": 180,
   "requires": {
     "platform": "linux/amd64",
-    "base": "spool-python313-workspace",
+    "base": "spool-debian12-workspace",
     "features": ["lazy-layers", "artifact-download"],
     "limits": { "max_layer_bytes": 65536 }
   },
   "layers": [
-    { "id": "source", "kind": "directory", "path": "workspace", "exclude": ["__pycache__"] }
+    { "id": "source", "kind": "directory", "path": "workspace" }
   ],
   "resources": { "timeout_s": 15 }
 }

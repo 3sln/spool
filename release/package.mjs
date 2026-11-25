@@ -14,7 +14,7 @@ const packageInfo = {
   repository: { type: "git", url: "git+https://github.com/3sln/spool.git" },
 };
 const clientFiles = [
-  "client/index.mjs", "client/layers.mjs", "client/node.mjs", "client/taskfile.mjs", "client/generated/js",
+  "client/index.mjs", "client/build-cache.mjs", "client/layers.mjs", "client/node.mjs", "client/taskfile.mjs", "client/generated/js",
 ];
 const packages = [
   {
@@ -27,8 +27,9 @@ const packages = [
       bin: { "spool-runner": "./bin/runner.mjs" },
       exports: { ".": "./src/node.mjs", "./worker": "./src/worker.mjs", "./contract": "./src/contract.mjs" },
       optionalDependencies: source.optionalDependencies,
+      dependencies: source.dependencies,
     },
-    files: ["src", "guest/Dockerfile", "guest/runner.py", "guest/.dockerignore", "bin/runner.mjs", "wrangler.jsonc"],
+    files: ["src", "guest/Dockerfile", "guest/Cargo.toml", "guest/Cargo.lock", "guest/src", "guest/.dockerignore", "bin/runner.mjs", "wrangler.jsonc"],
   },
   {
     manifest: { name: "@3sln/spool-mcp", description: "Stdio MCP client for Spool runners", bin: { "spool-mcp": "./bin/mcp.mjs" } },

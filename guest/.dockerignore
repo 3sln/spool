@@ -1,3 +1,6 @@
 *
 !Dockerfile
-!runner.py
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**

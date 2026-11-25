@@ -6,13 +6,33 @@ Discover bases, media types, limits, and authentication at `/.well-known/portabl
 
 The authenticated principal and `client_request_id` identify one submission for 24 hours after finalization. Repeating the same manifest returns the original resource. Submitting different content with the same key returns HTTP 409. Treat each `task_id` as opaque. A layer's SHA-256 covers the transmitted bytes, including compression. An environment's SHA-256 covers the UTF-8 canonical JSON of `{platform,environment}`. Canonical JSON recursively sorts object keys by UTF-16 code unit, preserves array order, and uses ECMAScript JSON string and integer formatting with no extra whitespace.
 
-## States, leases, and events
+## Deadlines and states
 
-`WAITING_FOR_LAYER` and `QUEUED` share an admission deadline. `RUNNING` denotes an exclusive claim, including sandbox startup, with a new execution lease. `SUCCEEDED`, `FAILED`, `CANCELLED` and `EXPIRED` are terminal. Cancellation records the outcome immediately and signals the executor. The coordinator discards results received after cancellation or lease expiry. A lost executor produces a terminal `SANDBOX_FAILURE`. Clients can resubmit with a new request ID.
+Every submission supplies a positive `task_timeout_s`. It starts at acceptance and covers layer uploads, queueing, startup, and execution. The runner advertises `limits.max_task_seconds`, which fixes `hard_deadline` at acceptance. The status field `task_deadline` is the requested whole-task deadline. `deadline` is the effective deadline in the current state. While waiting for layers or queueing, it is also bounded by the admission window. An optional `resources.timeout_s` separately limits command runtime. `execution_deadline_limit` gives the latest effective deadline the runner can grant after claiming the task.
 
-Events are records of `{job_id,sequence,type,time,data}`. The per-task sequence starts at 1. Reconnect to the SSE endpoint with `Last-Event-ID` or `cursor` and deduplicate by job ID and sequence. Streams close after about 20 seconds or after terminal replay. Disconnecting has no effect on the job. Logs are UTF-8 chunks recorded at completion with per-channel byte offsets.
+The owning principal can `POST /v1/tasks/{id}/extend` with `{"task_timeout_s":600}` to request a deadline 600 seconds after original acceptance. The task must be running before its effective deadline. Requests within the current deadline return the current state. An increase within the fixed limits records a `task.deadline_extended` event. Extending the task leaves an explicitly supplied command timeout in force.
 
-`layer.required` carries pending descriptors, a nonce, deadline and upload flow. Obtain the upload capability per digest and PUT the exact bytes with caller authentication. Replaying an accepted upload during its lease is idempotent. Cache entries are scoped to the tenant and can be evicted. A task re-requests a missing entry before a claim. A cache lease is advisory and separate from the upload and execution leases. Missing layers at the admission deadline yield `LAYER_UNAVAILABLE`. Artifact downloads require the owning principal and expire with task history.
+`RUNNING` denotes an exclusive claim and includes sandbox startup. `SUCCEEDED`, `FAILED`, `CANCELLED` and `EXPIRED` are terminal. Cancellation or expiry records the outcome and signals the executor. The coordinator discards results from an expired or cancelled claim. A lost executor can result in `SANDBOX_FAILURE` or deadline expiry. Clients can resubmit with a new request ID.
+
+## Observation
+
+Events are records of `{job_id,sequence,type,time,data}`. The per-task sequence starts at 1. `GET /v1/tasks/{id}/events` tails live events over SSE. Reconnect with `Last-Event-ID` or `cursor` and deduplicate by job ID and sequence. Streams close after about 20 seconds or after terminal replay. Disconnecting leaves the task running. Include `?cursor=0&limit=100` for a JSON page and use `next_cursor` on subsequent calls. `has_more` indicates unread events already available, and `terminal` indicates whether new events can still arrive. Both use the same sequence.
+
+Live `task.stdout` and `task.stderr` events carry UTF-8 chunks and per-channel byte offsets. Spool retains up to 128 KiB or 1,024 log events across the two channels and reports truncation in the terminal result.
+
+## Layer transfers
+
+The initial manifest declares each layer's exact compressed or raw transfer size and SHA-256. The runner checks discovery limits for each layer and the sum before admitting the task. Expanded layer data has a separate budget enforced during extraction.
+
+`layer.required` events and task status carry the pending descriptors and an `upload_plans` map indexed by digest. The plan names the transport, byte limit, expiry and authentication policy. A direct-upload plan includes a same-origin `prepare_url`. POST there to obtain the temporary URLs and completion endpoint. Plans are scoped to one task owner's requested digest.
+
+- `http-put` uploads exact bytes to the runner URL using its existing caller authentication.
+- `presigned-put` uploads exact bytes directly to object storage, then POSTs `{"parts":[]}` to the runner's `complete_url`.
+- `presigned-multipart` uploads each plan range to its own URL. Take the returned `ETag` for each part, then POST `{"parts":[{"number":1,"etag":"..."}]}` to the runner's `complete_url` in order. The runner completes the provider upload and verifies the assembled content. Retrying a part uses the same range and URL while the plan is valid.
+
+All transfer requests have the content length declared by their plan. Presigned requests omit runner credentials. A transport can supply a separate `bearer_token` scoped to its upload URL, and clients should apply their configured destination policy before using it. Completion requests are authenticated to the runner and can be retried.
+
+The cache is scoped to the tenant and can be evicted. The executor verifies the archived bytes again as they enter the offline guest. Cache retention is advisory and independent of the upload and task deadlines. Missing layers at the admission deadline yield `LAYER_UNAVAILABLE`. Artifact downloads require the owning principal and expire with task history.
 
 ## Client transport
 

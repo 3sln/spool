@@ -124,26 +124,57 @@ export function createClient({
     return retry(() => jsonRequest(path, { signal }), signal);
   };
 
-  async function upload(id, descriptor, bytes, { signal } = {}) {
-    const offer = await jsonRequest(`${layerPath(id, descriptor.digest)}/upload`, { method: "POST", signal });
-    if (offer.method !== "PUT" || typeof offer.url !== "string") {
+  async function upload(id, descriptor, bytes, { signal, plan } = {}) {
+    const offer = plan?.url ? plan : await jsonRequest(plan?.prepare_url ?? `${layerPath(id, descriptor.digest)}/upload`,
+      { method: "POST", signal });
+    if (offer.method !== "PUT" || (offer.max_size !== undefined && offer.max_size < descriptor.size)) {
       throw new SpoolError("UNSUPPORTED_UPLOAD", "Runner did not offer a PUT transfer");
     }
-    const response = await request(offer.url, {
-      method: "PUT", body: bytes, signal, transfer: true, authenticated: offer.authenticated !== false,
-      extra: { "content-type": "application/octet-stream" },
-    });
-    await response.body?.cancel();
+    const put = (url, body) => retry(() => request(url, {
+      method: "PUT", body, signal, transfer: true, authenticated: offer.authenticated !== false,
+      extra: { "content-type": "application/octet-stream", ...(offer.bearer_token
+        ? { authorization: `Bearer ${offer.bearer_token}` } : {}) },
+    }), signal);
+    const parts = [];
+    if (offer.type === "presigned-multipart") {
+      let offset = 0;
+      for (const [index, part] of (offer.parts ?? []).entries()) {
+        if (part.number !== index + 1 || part.offset !== offset || !Number.isSafeInteger(part.size)
+          || part.size <= 0 || offset + part.size > descriptor.size || typeof part.url !== "string") {
+          throw new SpoolError("UNSUPPORTED_UPLOAD", "Runner returned an invalid upload part");
+        }
+        const body = bytes instanceof Uint8Array ? bytes.subarray(offset, offset + part.size) : bytes.slice(offset, offset + part.size);
+        const response = await put(part.url, body);
+        const etag = response.headers.get("etag");
+        await response.body?.cancel();
+        if (!etag) throw new SpoolError("UNSUPPORTED_UPLOAD", "Storage did not return a part ETag");
+        parts.push({ number: part.number, etag });
+        offset += part.size;
+      }
+      if (offset !== descriptor.size || !offer.complete_url) {
+        throw new SpoolError("UNSUPPORTED_UPLOAD", "Runner returned an incomplete multipart plan");
+      }
+    } else {
+      if (typeof offer.url !== "string") throw new SpoolError("UNSUPPORTED_UPLOAD", "Runner returned no upload URL");
+      await (await put(offer.url, bytes)).body?.cancel();
+    }
+    if (offer.complete_url) await retry(() => jsonRequest(offer.complete_url, {
+      method: "POST", body: JSON.stringify({ parts }), signal,
+      extra: { "content-type": "application/json" },
+    }), signal);
   }
 
-  async function supply(id, required, { source = layerSource, signal } = {}) {
+  async function supply(id, required, { source = layerSource, signal, plans } = {}) {
     if (!required.length) return;
     if (typeof source !== "function") throw new SpoolError("LAYER_UNAVAILABLE", "No layer source is configured");
     for (const descriptor of required) {
       signal?.throwIfAborted();
       const bytes = await source(descriptor, { signal });
       if (!bytes) throw new SpoolError("LAYER_UNAVAILABLE", `Layer source has no bytes for ${descriptor.digest}`);
-      try { await retry(() => upload(id, descriptor, bytes, { signal }), signal); }
+      if ((bytes.size ?? bytes.byteLength) !== descriptor.size) {
+        throw new SpoolError("LAYER_INVALID", "Local bytes do not match the descriptor size");
+      }
+      try { await upload(id, descriptor, bytes, { signal, plan: plans?.[descriptor.digest] }); }
       catch (error) {
         if (![403, 404, 409].includes(error.status)) throw error;
         const current = await status(id, { signal });
@@ -156,12 +187,23 @@ export function createClient({
     capabilities: ({ signal } = {}) => jsonRequest("/.well-known/portable-task-runner", { signal }),
     submit(manifest, { signal } = {}) {
       if (!manifest?.client_request_id) throw new TypeError("Supply a stable client_request_id for submission retries");
+      if (!Number.isSafeInteger(manifest.task_timeout_s) || manifest.task_timeout_s < 1) throw new TypeError("Supply a positive task_timeout_s");
       const body = JSON.stringify(manifest);
       return retry(() => jsonRequest("/v1/tasks", {
         method: "POST", body, signal, extra: { "content-type": "application/json" },
       }), signal);
     },
     status,
+    extend(id, taskTimeoutSeconds, { signal } = {}) {
+      if (!Number.isSafeInteger(taskTimeoutSeconds) || taskTimeoutSeconds < 1) throw new TypeError("Supply a positive task_timeout_s");
+      const body = JSON.stringify({ task_timeout_s: taskTimeoutSeconds });
+      return retry(() => jsonRequest(`${taskPath(id)}/extend`, {
+        method: "POST", body, signal, extra: { "content-type": "application/json" },
+      }), signal);
+    },
+    eventPage(id, { cursor = 0, limit = 100, signal } = {}) {
+      return jsonRequest(`${taskPath(id)}/events?${new URLSearchParams({ cursor, limit })}`, { signal });
+    },
     cancel: (id, { signal } = {}) => jsonRequest(`${taskPath(id)}/cancel`, { method: "POST", signal }),
     artifacts: (id, { signal } = {}) => jsonRequest(`${taskPath(id)}/artifacts`, { signal }),
     download: (artifact, { signal } = {}) => request(artifact.url, {
@@ -172,7 +214,7 @@ export function createClient({
       for (;;) {
         const current = await status(id, { signal });
         if (terminal.has(current.state)) return current;
-        if (current.required.length) await supply(id, current.required, { source, signal });
+        if (current.required.length) await supply(id, current.required, { source, signal, plans: current.upload_plans });
         else await slept(pollMs, signal);
       }
     },

@@ -1,7 +1,7 @@
 {
   "version": "0.1",
   "kind": "task",
-  "extends": ["python-base.json"],
-  "command": { "argv": ["python", "main.py"], "cwd": "/workspace" },
+  "extends": ["debian-base.json"],
+  "command": { "argv": ["sh", "main.sh"], "cwd": "/workspace" },
   "outputs": { "paths": ["/workspace/result.txt"] }
 }

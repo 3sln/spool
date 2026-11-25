@@ -33,7 +33,13 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm test
+      - uses: DeLaGuardo/setup-clojure@3fe9b3ae632c6758d0b7757b0838606ef4287b08 # 13.4
+        with:
+          bb: 1.3.190
+      - run: rustup toolchain install 1.92.0 --profile minimal
+      - run: bb test
+        env:
+          RUSTUP_TOOLCHAIN: 1.92.0
 
   rust:
     name: Rust SDK and generated policy
@@ -48,6 +54,8 @@ jobs:
       - run: cargo +1.92.0 fmt --manifest-path sdk/rust/Cargo.toml --check
       - run: cargo +1.92.0 clippy --locked --manifest-path sdk/rust/Cargo.toml --all-targets -- -D warnings
       - run: cargo +1.92.0 test --locked --manifest-path sdk/rust/Cargo.toml
+      - run: cargo +1.92.0 fmt --manifest-path guest/Cargo.toml --check
+      - run: cargo +1.92.0 clippy --locked --manifest-path guest/Cargo.toml --all-targets -- -D warnings
 
   runners:
     name: Worker, Docker and JetStream
@@ -62,30 +70,29 @@ jobs:
           node-version: 24.6.0
           cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: DeLaGuardo/setup-clojure@3fe9b3ae632c6758d0b7757b0838606ef4287b08 # 13.4
+        with:
+          bb: 1.3.190
       - run: rustup toolchain install 1.92.0 --profile minimal
       - name: Workerd fixture
         env:
           WRANGLER_SEND_METRICS: 'false'
         run: |
           npm install --prefix "$RUNNER_TEMP/spool-tools" --no-audit --no-fund wrangler@4.168.0
-          SPOOL_TOOL_MODULES="$RUNNER_TEMP/spool-tools/node_modules" npm run test:worker
+          SPOOL_TOOL_MODULES="$RUNNER_TEMP/spool-tools/node_modules" bb test-worker
       - name: Build Linux guest and run both clients
         env:
           RUSTUP_TOOLCHAIN: 1.92.0
           SPOOL_TEST_RUST: '1'
         run: |
-          npm run guest:build
-          npm run test:oci
+          bb guest-build
+          bb test-oci
       - name: Distribute Docker jobs over JetStream
-        run: |
-          broker=$(docker run -d --rm -p 127.0.0.1::4222 nats:2.11-alpine -js)
-          trap 'docker stop "$broker" >/dev/null' EXIT
-          export SPOOL_NATS_URL="nats://$(docker port "$broker" 4222/tcp)"
-          npm run test:cluster
+        run: bb test-cluster
       - name: GitHub package consumer gate
         run: |
-          npm run release:pack
-          npm run release:check
+          bb release-pack
+          bb release-check
 
   verdict:
     if: always()

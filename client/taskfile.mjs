@@ -1,6 +1,6 @@
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import { buildDirectoryLayer } from "./node.mjs";
+import { buildKey, planDirectoryLayer } from "./node.mjs";
 import { TAR } from "./layers.mjs";
 
 const maxTemplateBytes = 128 * 1024;
@@ -88,14 +88,21 @@ async function builtinLayer(recipe, context) {
       || item.split("/").some((component) => !component || component === "." || component === ".."))) {
       throw new TypeError("exclude must contain workspace-relative paths");
     }
-    return { bytes: await buildDirectoryLayer(paths[0], {
+    const prepared = await planDirectoryLayer(paths[0], {
       previous: paths[1], maxBytes, signal,
       include: (path) => !exclude.some((excluded) => path === excluded || path.startsWith(`${excluded}/`)),
-    }), mediaType: TAR };
+    });
+    return { version: "1", fingerprint: () => prepared.fingerprint(), build: () => ({ bytes: prepared.build(), mediaType: TAR }) };
   }
   if (recipe.kind === "archive") {
     fields(recipe, ["id", "kind", "path", "media_type"], "archive layer");
-    return { bytes: await regularFile(await scopedPath(root, directory, recipe.path), maxBytes), mediaType: recipe.media_type ?? TAR };
+    const path = await scopedPath(root, directory, recipe.path);
+    const mediaType = recipe.media_type ?? TAR;
+    return {
+      import: typeof context.cache.importFile === "function"
+        ? () => context.cache.importFile(path, mediaType, { maxBytes, signal }) : undefined,
+      build: async () => ({ bytes: await regularFile(path, maxBytes), mediaType }),
+    };
   }
   return undefined;
 }
@@ -114,6 +121,7 @@ export async function prepareTaskFile(file, {
   let command = {};
   let resources = {};
   let outputs;
+  let taskTimeout;
 
   async function visit(path, isRoot = false) {
     signal?.throwIfAborted();
@@ -122,7 +130,7 @@ export async function prepareTaskFile(file, {
     if (visiting.size + done.size >= 32) throw new RangeError("Taskfile inheritance exceeds 32 files");
     visiting.add(path);
     const recipe = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await regularFile(path, maxTemplateBytes)));
-    fields(recipe, ["version", "kind", "extends", "requires", "layers", "command", "resources", "outputs", "metadata"], "Taskfile");
+    fields(recipe, ["version", "kind", "extends", "requires", "layers", "command", "resources", "task_timeout_s", "outputs", "metadata"], "Taskfile");
     if (recipe.version !== "0.1" || recipe.kind !== (isRoot ? "task" : "base")) {
       throw new Error(isRoot ? "Expected a 0.1 Taskfile task" : "Only 0.1 Taskfile bases can be extended");
     }
@@ -146,6 +154,10 @@ export async function prepareTaskFile(file, {
     if (recipe.resources !== undefined) {
       fields(recipe.resources, ["cpu", "memory_mib", "disk_mib", "timeout_s"], "resources");
       resources = { ...resources, ...recipe.resources };
+    }
+    if (recipe.task_timeout_s !== undefined) {
+      if (!Number.isSafeInteger(recipe.task_timeout_s) || recipe.task_timeout_s < 1) throw new TypeError("Invalid task_timeout_s");
+      taskTimeout = recipe.task_timeout_s;
     }
     if (recipe.outputs !== undefined) {
       fields(recipe.outputs, ["paths"], "outputs");
@@ -171,36 +183,64 @@ export async function prepareTaskFile(file, {
     throw new TypeError("Command cwd must be inside /workspace");
   }
   const limits = discovery.limits ?? {};
-  resources = { ...discovery.resource_profile, timeout_s: Math.min(60, limits.max_job_seconds ?? 60), ...resources };
-  for (const field of ["cpu", "memory_mib", "disk_mib", "timeout_s"]) {
+  if (taskTimeout === undefined) throw new TypeError("The Taskfile or a base must supply task_timeout_s");
+  if (taskTimeout > (limits.max_task_seconds ?? Infinity)) throw new RangeError("Task timeout exceeds the runner limit");
+  resources = { ...discovery.resource_profile, ...resources };
+  for (const field of ["cpu", "memory_mib", "disk_mib"]) {
     if (!Number.isInteger(resources[field]) || resources[field] <= 0) throw new TypeError(`Invalid resource request: ${field}`);
-    if (field !== "timeout_s" && discovery.resource_profile?.[field] !== undefined
-      && resources[field] !== discovery.resource_profile[field]) throw new Error(`Runner does not offer requested resources.${field}`);
+    if (discovery.resource_profile?.[field] !== undefined && resources[field] !== discovery.resource_profile[field]) throw new Error(`Runner does not offer requested resources.${field}`);
   }
-  if (resources.timeout_s > (limits.max_job_seconds ?? Infinity)) throw new Error("Task timeout exceeds the runner limit");
+  if (resources.timeout_s !== undefined && (!Number.isSafeInteger(resources.timeout_s) || resources.timeout_s < 1
+    || resources.timeout_s > (limits.max_job_seconds ?? Infinity))) throw new Error("Command timeout is outside the runner limits");
   if (recipes.size > (limits.max_layers ?? 16)) throw new RangeError("Taskfile contains too many layers");
   const evaluated = [];
   let total = 0;
   const maxBytes = limits.max_layer_bytes ?? 4 * 1024 ** 2;
   for (const [id, { recipe, directory }] of recipes) {
     signal?.throwIfAborted();
-    const context = { root, directory, maxBytes, signal };
-    const result = await builtinLayer(recipe, context) ?? (
-      Object.hasOwn(layerBuilders, recipe.kind)
-        ? await layerBuilders[recipe.kind](recipe, {
-          ...selected, runner: discovery, signal, maxBytes,
-          resolvePath: (path) => scopedPath(root, directory, path),
-        })
-        : undefined
-    );
-    if (!result || !(result.bytes instanceof Uint8Array) || !result.bytes.length) throw new Error(`Unsupported or empty layer recipe: ${recipe.kind}`);
-    total += result.bytes.length;
-    if (result.bytes.length > maxBytes || total > (limits.max_input_bytes ?? Infinity)) throw new RangeError("Layers exceed the runner byte limits");
-    if (!discovery.layer_media_types?.includes(result.mediaType)) throw new Error(`Runner does not support layer media type ${result.mediaType}`);
-    evaluated.push({ id, descriptor: await cache.put(result.bytes, result.mediaType) });
+    const context = { root, directory, maxBytes, signal, cache };
+    const plugin = Object.hasOwn(layerBuilders, recipe.kind) ? layerBuilders[recipe.kind] : undefined;
+    const parents = evaluated.map(({ descriptor }) => ({ ...descriptor }));
+    const buildContext = {
+      ...selected, parents, runner: discovery, signal, maxBytes,
+      resolvePath: (path) => scopedPath(root, directory, path),
+    };
+    const plan = await builtinLayer(recipe, context)
+      ?? (typeof plugin === "function" ? { build: () => plugin(recipe, buildContext) }
+        : plugin && string(plugin.version) && typeof plugin.fingerprint === "function" && typeof plugin.build === "function"
+          ? { version: plugin.version, fingerprint: () => plugin.fingerprint(recipe, buildContext),
+            build: () => plugin.build(recipe, buildContext) }
+          : undefined);
+    if (!plan) throw new Error(`Unsupported layer recipe: ${recipe.kind}`);
+    const validate = (size, mediaType) => {
+      if (size > maxBytes || total + size > (limits.max_input_bytes ?? Infinity)) throw new RangeError("Layers exceed the runner byte limits");
+      if (!discovery.layer_media_types?.includes(mediaType)) throw new Error(`Runner does not support layer media type ${mediaType}`);
+    };
+    const build = async () => {
+      const result = await plan.build();
+      if (!result || !(result.bytes instanceof Uint8Array) || !result.bytes.length) throw new Error(`Empty layer recipe: ${recipe.kind}`);
+      validate(result.bytes.length, result.mediaType);
+      return result;
+    };
+    let descriptor;
+    if (plan.import) {
+      descriptor = await plan.import();
+    } else if (plan.fingerprint && typeof cache.resolveBuild === "function") {
+      const inputs = await plan.fingerprint();
+      if (!string(inputs)) throw new Error(`Layer fingerprint must be a nonempty string: ${recipe.kind}`);
+      const key = buildKey(["taskfile-layer", 1, recipe.kind, plan.version, selected.platform.os, selected.platform.arch,
+        selected.base.id, selected.base.digest, parents.map((layer) => [layer.digest, layer.size, layer.media_type]), inputs]);
+      descriptor = await cache.resolveBuild(key, build, { signal });
+    } else {
+      const result = await build();
+      descriptor = await cache.put(result.bytes, result.mediaType);
+    }
+    validate(descriptor.size, descriptor.media_type);
+    total += descriptor.size;
+    evaluated.push({ id, descriptor });
   }
   const manifest = {
-    protocol_version: "0.1", client_request_id: requestId, platform: selected.platform,
+    protocol_version: "0.1", client_request_id: requestId, task_timeout_s: taskTimeout, platform: selected.platform,
     environment: { base: selected.base, layers: evaluated.map(({ descriptor }) => descriptor) },
     command, resources, network: { mode: "none" }, ...(outputs ? { outputs } : {}),
   };
@@ -212,6 +252,6 @@ export async function runTaskFile(file, { client, cache, onAccepted, signal, ...
   const prepared = await prepareTaskFile(file, { ...options, client, cache, signal });
   const task = await client.submit(prepared.manifest, { signal });
   await onAccepted?.(task);
-  const outcome = await client.wait(task.task_id, { source: cache.source, signal });
+  const outcome = await client.wait(task.task_id, { source: cache.open ?? cache.source, signal });
   return { ...prepared, task: outcome };
 }

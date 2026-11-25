@@ -12,14 +12,50 @@ pub const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 const MAX: usize = 4 * 1024 * 1024;
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
+    hex_digest(Sha256::digest(bytes))
+}
+
+fn hex_digest(bytes: impl IntoIterator<Item = u8>) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut digest = String::with_capacity(71);
     digest.push_str("sha256:");
-    for byte in Sha256::digest(bytes) {
+    for byte in bytes {
         digest.push(char::from(HEX[(byte >> 4) as usize]));
         digest.push(char::from(HEX[(byte & 15) as usize]));
     }
     digest
+}
+
+pub fn describe_reader(
+    mut input: impl Read,
+    media_type: &str,
+    maximum: usize,
+) -> Result<Descriptor> {
+    if !matches!(media_type, TAR | TAR_GZIP) {
+        return Err(Error::Invalid("Expected an OCI tar media type"));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut size: usize = 0;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count)
+            .filter(|size| *size <= maximum)
+            .ok_or(Error::Invalid("Layer exceeded its declared size"))?;
+        hasher.update(&buffer[..count]);
+    }
+    if size == 0 {
+        return Err(Error::Invalid("Expected a nonempty layer"));
+    }
+    Ok(Descriptor {
+        digest: hex_digest(hasher.finalize()),
+        size,
+        media_type: media_type.to_owned(),
+    })
 }
 
 pub fn describe(bytes: &[u8], media_type: &str) -> Result<Descriptor> {

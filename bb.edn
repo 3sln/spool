@@ -1,0 +1,40 @@
+{:paths ["tools"]
+ :tasks
+ {:requires ([babashka.fs :as fs] [spool.tools :as tooling])
+  serve {:doc "Start the self-hosted HTTP coordinator"
+         :task (apply shell "node" "bin/runner.mjs" "serve" *command-line-args*)}
+  agent {:doc "Run a JetStream execution agent"
+         :task (apply shell "node" "bin/runner.mjs" "agent" *command-line-args*)}
+  smoke {:doc "Run a portable smoke task against the configured runner"
+         :task (apply shell "node" "bin/smoke.mjs" *command-line-args*)}
+  mcp {:doc "Run or configure the stdio MCP server"
+       :task (apply shell "node" "bin/mcp.mjs" *command-line-args*)}
+  guest-build {:doc "Build the Linux/amd64 container guest with Docker or Podman"
+               :task (shell "node" "bin/runner.mjs" "guest-build")}
+  guest-dev {:doc "Build the native guest for host-side tests"
+             :task (shell "cargo" "build" "--locked" "--manifest-path" "guest/Cargo.toml")}
+  test {:doc "Run JavaScript and native guest integration tests"
+        :depends [guest-dev]
+        :task (apply shell {:extra-env {"SPOOL_GUEST_BIN" (tooling/guest-bin)}}
+                     "node" "--test" (map str (sort (fs/glob "test" "*.test.mjs"))))}
+  test-rust {:doc "Run locked Rust SDK checks"
+             :task (shell "cargo" "test" "--locked" "--manifest-path" "sdk/rust/Cargo.toml")}
+  test-worker {:doc "Bundle and test the Cloudflare Coordinator with local workerd"
+               :task (tooling/test-worker)}
+  test-oci {:doc "Test the runner and image on a real local OCI engine"
+            :task (do (shell "node" "test/live-oci.mjs")
+                      (when-not (System/getenv "SPOOL_URL")
+                        (shell "node" "test/live-guest-http.mjs")
+                        (shell "node" "test/live-large-layer.mjs")))}
+  test-cluster {:doc "Test two Docker runners over JetStream; start a broker if none is set"
+                :task (tooling/test-cluster)}
+  worker-check {:doc "Run Wrangler's Cloudflare build validation"
+                :task (shell "wrangler" "deploy" "--dry-run" "--outdir" ".wrangler/build")}
+  client-emit {:doc "Regenerate JavaScript and Rust client replay code with Kin"
+               :task (tooling/emit-client *command-line-args*)}
+  release-pack {:doc "Assemble npm packages and write the release checksums"
+                :task (apply shell "node" "release/package.mjs" *command-line-args*)}
+  release-check {:doc "Verify release checksums and install into a clean consumer"
+                 :task (apply shell "node" "release/check.mjs" *command-line-args*)}
+  release-build {:doc "Build and verify the complete release directory"
+                 :task (tooling/build-release (first *command-line-args*))}}}

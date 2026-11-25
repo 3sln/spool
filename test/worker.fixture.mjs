@@ -35,9 +35,20 @@ export class BlobBinding extends WorkerEntrypoint {
 
 export class GuestFixture extends DurableObject {
   async fetch(request) {
-    const payload = await request.json();
-    if (atob(payload.layers[0]) !== "tar") throw new Error("Expected bytes forwarded through the R2 adapter");
-    return Response.json({ exit_code: 0, stdout: "Cloudflare task completed\n" });
+    const url = new URL(request.url);
+    if (url.pathname === "/stop") return new Response(null, { status: 204 });
+    if (url.pathname === "/status") {
+      if (!await this.ctx.storage.get("started")) return new Response(null, { status: 404 });
+      if (url.searchParams.get("cursor") === "0") return Response.json({
+        logs: [{ channel: "stdout", text: "Cloudflare task running\n" }], cursor: 1, result: null,
+      });
+      return Response.json({ logs: [], cursor: 1, result: { exit_code: 0 } });
+    }
+    if (url.pathname !== "/start") return new Response(null, { status: 404 });
+    const payload = await request.text();
+    if (payload.slice(payload.indexOf("\n") + 1) !== "tar") throw new Error("Expected bytes forwarded through the R2 adapter");
+    await this.ctx.storage.put("started", true);
+    return new Response(null, { status: 202 });
   }
 }
 
@@ -46,10 +57,10 @@ export default {
     const bytes = new TextEncoder().encode("tar");
     const digest = await sha256(bytes);
     const manifest = {
-      protocol_version: "0.1", client_request_id: "worker", platform: { os: "linux", arch: "amd64" },
+      protocol_version: "0.1", task_timeout_s: 172800, client_request_id: "worker", platform: { os: "linux", arch: "amd64" },
       environment: { base: BASE, layers: [{ digest, size: bytes.length, media_type: MEDIA[0] }] },
       command: { argv: ["true"], cwd: "/workspace" }, network: { mode: "none" },
-      resources: { cpu: 1, memory_mib: 256, disk_mib: 64, timeout_s: 5 },
+      resources: { cpu: 1, memory_mib: 256, disk_mib: 4096 },
     };
     const call = (path, method = "GET", body) => worker.fetch(new Request(`https://spool.example${path}`, {
       method, body, headers: { authorization: `Bearer ${env.SPOOL_TOKEN}` },
@@ -61,9 +72,18 @@ export default {
     const offer = await call(`${initial.links.self}/layers/${digest}/upload`, "POST");
     const uploaded = await call((await offer.json()).url, "PUT", bytes);
     if (uploaded.status !== 200) throw new Error(`Upload failed: ${uploaded.status} ${await uploaded.text()}`);
+    let page;
+    for (let i = 0; i < 70; i++) {
+      page = await (await call(`${initial.links.events}?limit=100`)).json();
+      if (page.events.some(({ type }) => type === "task.stdout")) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (page.terminal || !page.events.some(({ type }) => type === "task.stdout")) throw new Error("Expected live progress");
+    const extended = await call(`${initial.links.self}/extend`, "POST", JSON.stringify({ task_timeout_s: 259200 }));
+    if (extended.status !== 200) throw new Error(`Extension failed: ${extended.status} ${await extended.text()}`);
     const events = await call(initial.links.events);
     const replay = await events.text();
-    if (!replay.includes("layer.available") || !replay.includes("Cloudflare task completed") || !replay.includes("SUCCEEDED")) {
+    if (!replay.includes("layer.available") || !replay.includes("Cloudflare task running") || !replay.includes("SUCCEEDED")) {
       throw new Error(`Expected a complete Worker task: ${replay}`);
     }
   },

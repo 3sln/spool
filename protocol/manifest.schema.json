@@ -3,10 +3,11 @@
   "$id": "urn:3sln:spool:manifest:0.1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["protocol_version", "client_request_id", "platform", "environment", "command", "resources", "network"],
+  "required": ["protocol_version", "client_request_id", "task_timeout_s", "platform", "environment", "command", "resources", "network"],
   "properties": {
     "protocol_version": { "const": "0.1" },
     "client_request_id": { "type": "string", "pattern": "^[a-zA-Z0-9._:-]{1,128}$" },
+    "task_timeout_s": { "type": "integer", "minimum": 1, "maximum": 2147483 },
     "platform": {
       "type": "object", "additionalProperties": false, "required": ["os", "arch"],
       "properties": { "os": { "const": "linux" }, "arch": { "const": "amd64" } }
@@ -16,7 +17,7 @@
       "properties": {
         "base": {
           "type": "object", "additionalProperties": false, "required": ["id", "digest"],
-          "properties": { "id": { "const": "spool-python313-workspace" }, "digest": { "const": "sha256:70bda1e795ded2a684ef9815955e05829b14ee5bb5c3eb2a940648e88f10fce9" } }
+          "properties": { "id": { "const": "spool-debian12-workspace" }, "digest": { "const": "sha256:311f7a192fd9a92b165a86b32fa3aae9005b11849bfb1db2d4fd784559ee464f" } }
         },
         "layers": {
           "type": "array", "maxItems": 16,
@@ -25,7 +26,7 @@
             "properties": {
               "digest": { "$ref": "#/$defs/digest" },
               "media_type": { "enum": ["application/vnd.oci.image.layer.v1.tar", "application/vnd.oci.image.layer.v1.tar+gzip"] },
-              "size": { "type": "integer", "minimum": 1, "maximum": 4194304 }
+              "size": { "type": "integer", "minimum": 1, "maximum": 2147483648 }
             }
           }
         }
@@ -39,12 +40,12 @@
       }
     },
     "resources": {
-      "type": "object", "additionalProperties": false, "required": ["cpu", "memory_mib", "disk_mib", "timeout_s"],
+      "type": "object", "additionalProperties": false, "required": ["cpu", "memory_mib", "disk_mib"],
       "properties": {
         "cpu": { "const": 1 },
         "memory_mib": { "const": 256 },
-        "disk_mib": { "const": 64 },
-        "timeout_s": { "type": "integer", "minimum": 1, "maximum": 120 }
+        "disk_mib": { "type": "integer", "minimum": 64, "maximum": 8192 },
+        "timeout_s": { "type": "integer", "minimum": 1, "maximum": 2147483 }
       }
     },
     "network": {

@@ -46,7 +46,7 @@ exec docker "$@"
   const signal=AbortSignal.timeout(100_000);
   const advertised=await client.capabilities({signal});
   const inputs=Array.from({length:4},(_,i)=>({
-    protocol_version:"0.1",client_request_id:`${marker}-${i}`,platform:{os:"linux",arch:"amd64"},
+    protocol_version:"0.1",task_timeout_s:180,client_request_id:`${marker}-${i}`,platform:{os:"linux",arch:"amd64"},
     environment:{base:advertised.bases[0],layers:[descriptor]},
     command:{argv:["sh","-ec","sleep 2; cat marker > result.txt"],cwd:"/workspace"},
     resources:{...advertised.resource_profile,timeout_s:15},network:{mode:"none"},

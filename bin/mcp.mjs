@@ -4,7 +4,7 @@ import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import manifestSchema from "../protocol/manifest.schema.json" with { type: "json" };
 import { createClient } from "../client/index.mjs";
-import { buildDirectoryLayer, openLayerCache } from "../client/node.mjs";
+import { openLayerCache } from "../client/node.mjs";
 import { prepareTaskFile } from "../client/taskfile.mjs";
 import pkg from "../package.json" with { type: "json" };
 import { cliState, initializeCli, parseCli, usage } from "./mcp-config.mjs";
@@ -24,7 +24,8 @@ async function serve(options, env) {
     const workspace = workspacePathOption && await realpath(workspacePathOption);
     const client = createClient({
       url: options.runner ?? env.SPOOL_URL ?? "http://127.0.0.1:8787",
-      layerSource: cache.source,
+      allowTransferURL: (url) => (env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((item) => item.trim()).includes(url.origin),
+      layerSource: cache.open,
       headers() {
         const headers = {};
         if (env.SPOOL_TOKEN) headers.authorization = `Bearer ${env.SPOOL_TOKEN}`;
@@ -47,16 +48,16 @@ async function serve(options, env) {
     }
 
     const id = { type: "string" };
-    const deadline = { type: "integer", minimum: 1, maximum: 120 };
+    const deadline = { type: "integer", minimum: 1, maximum: 3600 };
     const fields = (properties, required = Object.keys(properties)) => ({ type: "object", properties, required, additionalProperties: false });
     const idArgs = fields({ task_id: id });
     const tools = {
       capabilities: ["Discover available platforms, bases and limits", fields({}), () => client.capabilities()],
       build_layer: ["Build and cache a workspace snapshot or directory delta", fields(
         { directory: id, previous: id }, ["directory"],
-      ), async ({ directory, previous }, signal) => cache.put(await buildDirectoryLayer(
+      ), async ({ directory, previous }, signal) => cache.buildDirectory(
         await workspacePath(directory), { previous: previous === undefined ? undefined : await workspacePath(previous), signal },
-      ))],
+      )],
       submit_template: ["Build a checked-in JSON Taskfile and submit the resolved manifest", fields(
         { path: id, client_request_id: id }, ["path"],
       ), async ({ path, client_request_id }, signal) => {
@@ -70,7 +71,7 @@ async function serve(options, env) {
       wait_task: ["Supply requested layers from the client cache and wait for task completion", fields(
         { task_id: id, wait_s: deadline }, ["task_id"],
       ), async ({ task_id, wait_s = 20 }, signal) => {
-        if (!Number.isInteger(wait_s) || wait_s < 1 || wait_s > 120) throw new TypeError("Invalid wait_s");
+        if (!Number.isInteger(wait_s) || wait_s < deadline.minimum || wait_s > deadline.maximum) throw new TypeError("Invalid wait_s");
         const timeout = AbortSignal.timeout(wait_s * 1000);
         try { return await client.wait(task_id, { signal: AbortSignal.any([signal, timeout]) }); }
         catch (error) {
@@ -78,6 +79,12 @@ async function serve(options, env) {
           return client.status(task_id, { signal });
         }
       }],
+      extend_task: ["Extend a running task using total seconds since submission", fields({
+        task_id: id, task_timeout_s: { type: "integer", minimum: 1 },
+      }), ({ task_id, task_timeout_s }, signal) => client.extend(task_id, task_timeout_s, { signal })],
+      task_events: ["Page through live task events and stdout and stderr using a cursor", fields({
+        task_id: id, cursor: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 100 },
+      }, ["task_id"]), ({ task_id, cursor, limit }, signal) => client.eventPage(task_id, { cursor, limit, signal })],
       cancel_task: ["Cancel a durable task explicitly", idArgs, ({ task_id }, signal) => client.cancel(task_id, { signal })],
       task_artifacts: ["List a task's output artifacts", idArgs, ({ task_id }, signal) => client.artifacts(task_id, { signal })],
       read_artifact: ["Read an artifact from a task as base64", fields({ task_id: id, path: id }),

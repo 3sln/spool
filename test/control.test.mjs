@@ -2,14 +2,15 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { gzipSync } from "node:zlib";
 import { test } from "node:test";
 import { nodeHandler } from "../src/node.mjs";
-import { createClient } from "../client/index.mjs";
+import { buildLayer, createClient } from "../client/index.mjs";
 import { buildDirectoryLayer, openLayerCache } from "../client/node.mjs";
 import { prepareTaskFile, runTaskFile } from "../client/taskfile.mjs";
 import { configuredAuth, jwtVerifier, staticToken, tenantFor } from "../src/auth.mjs";
-import { BASE, Fault, MEDIA, sha256 } from "../src/contract.mjs";
+import { BASE, configuredLimits, Fault, MEDIA, sha256 } from "../src/contract.mjs";
 import { TaskService } from "../src/service.mjs";
 import { openData } from "../src/sqlite.mjs";
 
@@ -31,43 +32,45 @@ function request(handler, path, { user = "alice", method = "GET", body, headers 
 
 function manifest(client_request_id, layers = []) {
   return {
-    protocol_version: "0.1", client_request_id, platform: { os: "linux", arch: "amd64" },
+    protocol_version: "0.1", task_timeout_s: 180, client_request_id, platform: { os: "linux", arch: "amd64" },
     environment: { base: BASE, layers },
     command: { argv: ["sh", "-c", "cat value.txt; cat value.txt > result.txt"], cwd: "/workspace" },
-    resources: { cpu: 1, memory_mib: 256, disk_mib: 64, timeout_s: 3 }, network: { mode: "none" },
+    resources: { cpu: 1, memory_mib: 256, disk_mib: 4096, timeout_s: 3 }, network: { mode: "none" },
     outputs: { paths: ["/workspace/result.txt"] },
   };
 }
 
-function fixtureLayer(entries, compressed = false) {
-  const code = [
-    "import io,json,sys,tarfile",
-    "with tarfile.open(fileobj=sys.stdout.buffer, mode=sys.argv[2]) as tar:",
-    " for name, value in json.loads(sys.argv[1]):",
-    "  data = value.encode()",
-    "  member = tarfile.TarInfo(name)",
-    "  member.size = len(data)",
-    "  tar.addfile(member, io.BytesIO(data))",
-  ].join("\n");
-  return new Promise((resolve, reject) => {
-    execFile("python3", ["-c", code, JSON.stringify(entries), compressed ? "w|gz" : "w|"],
-      { encoding: "buffer" }, async (error, raw) => {
-        if (error) reject(error);
-        else resolve({ raw, descriptor: { digest: await sha256(raw), size: raw.length, media_type: MEDIA[Number(compressed)] } });
-      });
-  });
+async function fixtureLayer(entries, compressed = false) {
+  const encoder = new TextEncoder();
+  const tar = buildLayer(entries.map(([path, text]) => path.startsWith(".wh.")
+    ? { kind: "delete", path: path.slice(4) }
+    : { kind: "file", path: path.replace(/^\.\.\//u, "xx/"), bytes: encoder.encode(text) }));
+  if (entries[0][0].startsWith("../")) {
+    const header = tar.subarray(0, 512);
+    header.set(encoder.encode(entries[0][0]));
+    header.fill(32, 148, 156);
+    const checksum = header.reduce((sum, byte) => sum + byte, 0).toString(8).padStart(6, "0");
+    header.set(encoder.encode(checksum + "\0 "), 148);
+  }
+  const raw = compressed ? gzipSync(tar) : tar;
+  return { raw, descriptor: { digest: await sha256(raw), size: raw.length, media_type: MEDIA[Number(compressed)] } };
 }
 
-async function runGuest(work) {
+async function runGuest(work, _signal, _id, _log, readLayer) {
   const directory = await mkdtemp(join(tmpdir(), "spool-guest-"));
+  const binary = process.env.SPOOL_GUEST_BIN ?? resolve("guest/target/debug/spool-guest");
   try {
+    const layers = [];
+    for (const [index] of work.manifest.environment.layers.entries()) {
+      layers.push(Buffer.from(await readLayer(index)).toString("base64"));
+    }
     return await new Promise((resolve, reject) => {
-      const child = execFile("python3", ["guest/runner.py", "stdio", "--workspace", directory],
+      const child = execFile(binary, ["stdio", "--workspace", directory],
         { maxBuffer: 2 * 1024 ** 2 }, (error, stdout) => {
           if (error) reject(error);
           else resolve(JSON.parse(stdout));
         });
-      child.stdin.end(JSON.stringify(work));
+      child.stdin.end(JSON.stringify({ ...work, layers }));
     });
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
@@ -297,7 +300,7 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   await writeFile(join(fixture, "value.txt"), "reusable layer");
   const write = (path, contents) => writeFile(join(root, path), JSON.stringify({ version: "0.1", ...contents }));
   await write("base.json", {
-    kind: "base", requires: { platform: "linux/amd64", base: BASE.id, features: ["lazy-layers"] },
+    kind: "base", task_timeout_s: 60, requires: { platform: "linux/amd64", base: BASE.id, features: ["lazy-layers"] },
     layers: [{ id: "source", kind: "directory", path: "source" }],
     command: { cwd: "/workspace" },
   });
@@ -375,4 +378,74 @@ test("browser preflights permit configured origins without bypassing task authen
   });
   assert.equal(foreign.status, 403);
   assert.equal(foreign.headers.has("access-control-allow-origin"), false);
+});
+
+test("a task's submitter chooses its timeout and can extend a running lease after observing live progress", async (t) => {
+  const data = openData(":memory:");
+  t.after(() => data.close());
+  const limits = configuredLimits({ SPOOL_MAX_TASK_SECONDS: "259200" });
+  const service = new TaskService(data.store, data.blobs, { limits });
+  const handler = nodeHandler(service, auth);
+  const client = createClient({
+    url: "http://spool.test", headers: { "x-fixture-user": "alice" },
+    fetch: (url, options) => handler(new Request(url, options)),
+  });
+  assert.equal((await client.capabilities()).limits.max_task_seconds, 259200);
+  const { task_timeout_s: _, ...missing } = manifest("missing-timeout");
+  assert.equal((await request(handler, "/v1/tasks", { method: "POST", body: missing })).status, 400);
+  const multiDay = manifest("three-days");
+  multiDay.task_timeout_s = 259200;
+  multiDay.resources.timeout_s = 200000;
+  const long = await client.submit(multiDay);
+  assert.equal(Date.parse(long.task_deadline) - Date.parse(long.created_at), 259200000);
+  await client.cancel(long.task_id);
+  multiDay.task_timeout_s++;
+  await assert.rejects(client.submit(multiDay), { code: "RESOURCE_LIMIT" });
+
+  const short = manifest("extend");
+  short.task_timeout_s = 2;
+  short.resources.timeout_s = 20;
+  const job = await client.submit(short);
+  const started = Promise.withResolvers();
+  const finish = Promise.withResolvers();
+  const running = service.run(job.task_id, async (_work, signal, _id, onLog) => {
+    await onLog({ channel: "stdout", text: "checkpoint completed\n" });
+    started.resolve();
+    await finish.promise;
+    assert.equal(signal.aborted, false);
+    return { exit_code: 0 };
+  });
+  t.after(() => finish.resolve());
+  await started.promise;
+  const page = await client.eventPage(job.task_id);
+  assert.equal(page.terminal, false);
+  assert.ok(page.events.some(({ type, data }) => type === "task.stdout" && data.text.includes("checkpoint")));
+  const updated = await client.extend(job.task_id, 10);
+  assert.ok(Date.parse(updated.deadline) > Date.parse(job.deadline));
+  await assert.rejects(client.extend(job.task_id, 259201), { code: "RESOURCE_LIMIT" });
+  await new Promise((resolve) => setTimeout(resolve, 2100));
+  assert.equal((await client.status(job.task_id)).state, "RUNNING");
+  finish.resolve();
+  await running;
+  const tail = await client.eventPage(job.task_id, { cursor: page.next_cursor });
+  assert.equal(tail.terminal, true);
+  assert.deepEqual(tail.events.map(({ type }) => type), ["task.deadline_extended", "task.completed"]);
+  await assert.rejects(client.extend(job.task_id, 11), { code: "TASK_NOT_RUNNING" });
+});
+
+test("deadline expiry fences running claims and aborts the executor without a polling client", { timeout: 5_000 }, async (t) => {
+  const data = openData(":memory:");
+  t.after(() => data.close());
+  const service = new TaskService(data.store, data.blobs);
+  const handler = nodeHandler(service, auth);
+  const short = manifest("unattended-expiry");
+  short.task_timeout_s = 1;
+  const task = await submit(handler, short);
+  await service.run(task.task_id, async (_work, signal) => {
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    return { exit_code: 0 };
+  });
+  const status = await (await request(handler, task.links.self)).json();
+  assert.equal(status.state, "EXPIRED");
+  assert.equal(status.result.error, "DEADLINE_EXCEEDED");
 });

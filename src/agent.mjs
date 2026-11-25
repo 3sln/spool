@@ -23,11 +23,11 @@ async function call(id, action, body) {
   const response = await fetch(new URL(`/internal/${id}/${action}`, coordinator), {
     method: "POST", redirect: "error", headers: {
       authorization: `Bearer ${env.SPOOL_WORKER_TOKEN}`, "content-type": "application/json",
-    }, body: JSON.stringify(body), signal: AbortSignal.timeout(10_000),
+    }, body: JSON.stringify(body), signal: AbortSignal.timeout(action === "layer" ? 600_000 : 10_000),
   });
   if (response.status === 204) return null;
   if (!response.ok) throw new Error(`Coordinator returned ${response.status}`);
-  return response.json();
+  return action === "layer" ? response.body : response.json();
 }
 
 async function processMessage(message) {
@@ -45,17 +45,23 @@ async function processMessage(message) {
       const task = new AbortController();
       const executionSignal = AbortSignal.any([signal.signal, task.signal, AbortSignal.timeout(Math.max(0, work.expires - Date.now()))]);
       let checking = false;
+      let lastLive = Date.now();
       const cancellation = setInterval(async () => {
         if (checking) return;
         checking = true;
         try {
           if (!(await call(job.id, "live", { claim: work.claim })).live) task.abort();
+          else lastLive = Date.now();
         } catch {
-          // Loss of the coordinator is bounded independently by the execution deadline.
+          if (Date.now() - lastLive >= 15_000) task.abort();
         } finally { checking = false; }
       }, 1500);
       let result;
-      try { result = await executor(work, executionSignal, job.id); }
+      try {
+        result = await executor(work, executionSignal, job.id,
+          (chunk) => call(job.id, "log", { claim: work.claim, chunk }),
+          (index) => call(job.id, "layer", { claim: work.claim, index }));
+      }
       catch (error) { console.error("OCI execution:", error.message); result = { error: "SANDBOX_FAILURE" }; }
       finally { clearInterval(cancellation); }
       await call(job.id, "finish", { claim: work.claim, result });

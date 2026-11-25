@@ -33,17 +33,39 @@ paths:
           description: Current task state.
           content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/extend:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }]
+    post:
+      operationId: extendTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_timeout_s]
+              properties:
+                task_timeout_s: { type: integer, minimum: 1, description: Total seconds from original task acceptance. }
+      responses:
+        '200':
+          description: Current task state with its effective deadline.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
+        '409': { $ref: '#/components/responses/Error' }
+        default: { $ref: '#/components/responses/Error' }
   /v1/tasks/{id}/events:
     parameters: [{ $ref: '#/components/parameters/TaskId' }]
     get:
       operationId: taskEvents
       parameters:
         - { name: cursor, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: limit, in: query, description: Include this to request a JSON page., schema: { type: integer, minimum: 1, maximum: 100 } }
         - { name: Last-Event-ID, in: header, schema: { type: integer, minimum: 0 } }
       responses:
         '200':
-          description: SSE frames containing Event records after the supplied cursor.
-          content: { text/event-stream: { schema: { type: string } } }
+          description: Live SSE frames or a JSON page containing events after the supplied cursor.
+          content:
+            text/event-stream: { schema: { type: string } }
+            application/json: { schema: { $ref: '#/components/schemas/EventPage' } }
         default: { $ref: '#/components/responses/Error' }
   /v1/tasks/{id}/cancel:
     parameters: [{ $ref: '#/components/parameters/TaskId' }]
@@ -60,17 +82,33 @@ paths:
       operationId: requestLayerUpload
       responses:
         '200':
-          description: Task-bound authenticated PUT capability.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [method, url, expires_at, authenticated]
-                properties:
-                  method: { const: PUT }
-                  url: { type: string, format: uri-reference }
-                  expires_at: { type: string, format: date-time }
-                  authenticated: { const: true }
+          description: The transfer plan with concrete URLs for the requesting client.
+          content: { application/json: { schema: { $ref: '#/components/schemas/UploadPlan' } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/layers/{digest}/complete:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/Digest' }]
+    post:
+      operationId: completeDirectUpload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [parts]
+              properties:
+                parts:
+                  type: array
+                  items:
+                    type: object
+                    required: [number, etag]
+                    properties:
+                      number: { type: integer, minimum: 1 }
+                      etag: { type: string }
+      responses:
+        '200':
+          description: The layer was verified against the submitted descriptor.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
         default: { $ref: '#/components/responses/Error' }
   /v1/tasks/{id}/layers/{digest}:
     parameters: [{ $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/Digest' }]
@@ -164,16 +202,22 @@ components:
   schemas:
     Task:
       type: object
-      required: [task_id, state, created_at, deadline, cursor, required, links]
+      required: [task_id, state, created_at, deadline, task_deadline, hard_deadline, cursor, required, upload_plans, links]
       properties:
         task_id: { type: string, pattern: '^[0-9a-f-]{36}$' }
         state: { enum: [WAITING_FOR_LAYER, QUEUED, RUNNING, SUCCEEDED, FAILED, EXPIRED, CANCELLED] }
         created_at: { type: string, format: date-time }
         deadline: { type: string, format: date-time }
+        task_deadline: { type: string, format: date-time }
+        hard_deadline: { type: string, format: date-time }
+        execution_deadline_limit: { type: string, format: date-time }
         cursor: { type: integer, minimum: 0 }
         required:
           type: array
           items: { $ref: './manifest.schema.json#/properties/environment/properties/layers/items' }
+        upload_plans:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/UploadPlan' }
         result:
           type: object
           properties:
@@ -182,6 +226,30 @@ components:
             retryable: { type: boolean }
             output_truncated: { type: boolean }
         links: { type: object, additionalProperties: { type: string, format: uri-reference } }
+    UploadPlan:
+      type: object
+      required: [type, max_size, expires_at]
+      properties:
+        type: { enum: [http-put, presigned-put, presigned-multipart] }
+        method: { const: PUT }
+        max_size: { type: integer, minimum: 1 }
+        expires_at: { type: string, format: date-time }
+        authenticated: { type: boolean }
+        bearer_token: { type: string }
+        url: { type: string, format: uri-reference }
+        prepare_url: { type: string, format: uri-reference }
+        complete_url: { type: string, format: uri-reference }
+        part_size: { type: integer, minimum: 1 }
+        parts:
+          type: array
+          items:
+            type: object
+            required: [number, offset, size, url]
+            properties:
+              number: { type: integer, minimum: 1 }
+              offset: { type: integer, minimum: 0 }
+              size: { type: integer, minimum: 1 }
+              url: { type: string, format: uri }
     Event:
       type: object
       required: [job_id, sequence, type, time, data]
@@ -191,6 +259,14 @@ components:
         type: { type: string }
         time: { type: string, format: date-time }
         data: { type: object }
+    EventPage:
+      type: object
+      required: [events, next_cursor, terminal, has_more]
+      properties:
+        events: { type: array, items: { $ref: '#/components/schemas/Event' } }
+        next_cursor: { type: integer, minimum: 0 }
+        terminal: { type: boolean }
+        has_more: { type: boolean }
     Artifact:
       type: object
       required: [path, digest, size, media_type, url]

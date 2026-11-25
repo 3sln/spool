@@ -15,8 +15,8 @@ function failure(error, auth) {
   return json({ error: error.code, message: error.message }, error.status, headers);
 }
 
-export function publicEndpoint(auth, origins, execution, dispatch) {
-  const advertised = capabilities(auth.profile, execution);
+export function publicEndpoint(auth, origins, execution, dispatch, limits) {
+  const advertised = capabilities(auth.profile, execution, limits);
   const methods = ["GET", "POST", "PUT"];
   const allowedHeaders = "authorization, content-type, last-event-id, cf-access-client-id, cf-access-client-secret";
   const allowedOrigins = new Set(origins.map((origin) => origin.trim()).filter(Boolean));
@@ -68,6 +68,13 @@ export async function taskEndpoint(request, tenant, service) {
     if (prefix || api !== "v1" || tasks !== "tasks" || !taskPattern.test(taskId ?? "") || rest.length) return notFound();
     if (!sub && item === undefined && method === "GET") return json(await service.status(tenant, taskId));
     if (sub === "cancel" && item === undefined && method === "POST") return json(await service.cancel(tenant, taskId));
+    if (sub === "extend" && item === undefined && method === "POST") {
+      return json(await service.extend(tenant, taskId, (await readJSON(request, 1024))?.task_timeout_s));
+    }
+    if (sub === "events" && item === undefined && method === "GET" && url.searchParams.has("limit")) {
+      return json(await service.eventPage(tenant, taskId, Number(url.searchParams.get("cursor") ?? 0),
+        Number(url.searchParams.get("limit"))));
+    }
     if (sub === "events" && item === undefined && method === "GET") {
       const cursor = Number(request.headers.get("last-event-id") ?? url.searchParams.get("cursor") ?? 0);
       if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Fault("INVALID_MANIFEST", "Invalid event cursor");
@@ -78,6 +85,9 @@ export async function taskEndpoint(request, tenant, service) {
     }
     if (sub === "layers" && digestPattern.test(item ?? "")) {
       if (action === "upload" && method === "POST") return json(await service.uploadOffer(tenant, taskId, item));
+      if (action === "complete" && method === "POST") {
+        return json(await service.completeUpload(tenant, taskId, item, (await readJSON(request, 64 * 1024))?.parts));
+      }
       if (action === "retain" && method === "POST") {
         return json(await service.retain(tenant, taskId, item, (await readJSON(request, 1024))?.ttl_s));
       }

@@ -30,14 +30,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_nanos()
     );
     let manifest = json!({
-        "protocol_version": "0.1", "client_request_id": id,
+        "protocol_version": "0.1", "task_timeout_s": 180, "client_request_id": id,
         "platform": {"os": "linux", "arch": "amd64"},
         "environment": {"base": capabilities["bases"][0], "layers": [layer]},
         "command": {"argv": ["sh", "-ec", "cat message.txt; cp message.txt result.txt"], "cwd": "/workspace"},
-        "resources": {"cpu": 1, "memory_mib": 256, "disk_mib": 64, "timeout_s": 10},
+        "resources": {"cpu": 1, "memory_mib": 256, "disk_mib": capabilities["resource_profile"]["disk_mib"], "timeout_s": 10},
         "network": {"mode": "none"}, "outputs": {"paths": ["/workspace/result.txt"]}
     });
     let job = client.submit(&manifest)?;
+    if job.required.iter().any(|required| required == &layer) {
+        let file = cache_dir.path().join("input.tar");
+        std::fs::write(&file, &bytes)?;
+        client.upload_file(&job.task_id, &layer, file)?;
+    }
     let done = client.wait(&job.task_id, Duration::from_secs(120), |layer| {
         cache.read(layer)
     })?;
