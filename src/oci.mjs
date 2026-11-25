@@ -63,7 +63,7 @@ export function ociExecutor(env) {
     const quota = workspaceDriver === "quota";
     const memory = quota ? 384 : 384 + workspace;
     const mounts = quota ? ["--storage-opt", `size=${workspace}m`] :
-      ["--read-only", "--tmpfs", `/workspace:rw,nosuid,nodev,size=${workspace}m,mode=0755,uid=65532,gid=65532`];
+      ["--read-only", "--tmpfs", `/workspace:rw,nosuid,nodev,size=${workspace}m,mode=1777`];
     try {
       if (signal.aborted) return { error: "CANCELLED" };
       await engineCommand(engine, [

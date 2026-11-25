@@ -226,8 +226,15 @@ export class GuestSlot extends DurableObject {
 
   async startGuest(container, deadline, body) {
     const cancelled = () => this.ctx.storage.get("cancelled");
+    const alias = this.env.SPOOL_CONTAINER_IMAGE;
+    const startOptions = {};
+    if (alias) {
+      startOptions.image = container.images?.[alias];
+      if (!startOptions.image) throw new Error(`Unknown guest container image ${alias}`);
+      startOptions.instance = this.env.SPOOL_CONTAINER_INSTANCE || "standard-2";
+    }
     let port;
-    try { port = await waitForGuest(container, deadline, cancelled); }
+    try { port = await waitForGuest(container, deadline, cancelled, { startOptions }); }
     catch (error) {
       console.error("Cloudflare guest startup", error.message, error.cause?.message);
       throw error;

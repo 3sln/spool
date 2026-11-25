@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { waitForGuest } from "../src/cloud-startup.mjs";
 
-function fixture(probe) {
+function fixture(probe, expectedOptions = { enableInternet: false }) {
   let starts = 0;
   let probes = 0;
   let monitor;
@@ -18,7 +18,7 @@ function fixture(probe) {
     container: {
       running: false,
       start(options) {
-        assert.deepEqual(options, { enableInternet: false });
+        assert.deepEqual(options, expectedOptions);
         starts++;
         monitor = Promise.withResolvers();
       },
@@ -27,6 +27,13 @@ function fixture(probe) {
     },
   };
 }
+
+test("the named guest image and instance size preserve offline startup", async () => {
+  const launch = { image: "pinned-guest", instance: "standard-2" };
+  const guest = fixture(() => new Response(null, { status: 204 }), { ...launch, enableInternet: false });
+  await waitForGuest(guest.container, Date.now() + 2000, () => false, { startOptions: launch });
+  assert.equal(guest.starts, 1);
+});
 
 test("readiness errors never restart an unsettled Cloudflare container", async () => {
   const guest = fixture((probes) => {

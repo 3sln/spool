@@ -6,6 +6,7 @@ function retryableStart(error) {
 
 // A readiness probe can fail before Cloudflare settles the start attempt.
 export async function waitForGuest(container, deadline, cancelled, {
+  startOptions = {},
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   let attempt;
@@ -15,7 +16,7 @@ export async function waitForGuest(container, deadline, cancelled, {
     if (!attempt) {
       attempt = {};
       try {
-        if (!container.running) container.start({ enableInternet: false });
+        if (!container.running) container.start({ ...startOptions, enableInternet: false });
         const current = attempt;
         container.monitor().then(
           () => { current.error = new Error("Guest exited during startup"); },
