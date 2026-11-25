@@ -21,7 +21,8 @@ try {
   const cache = await openLayerCache(join(directory, "cache"));
   const descriptor = await cache.importFile(raw, TAR);
   assert.ok(descriptor.size > size);
-  runner = await start({ SPOOL_TOKEN: token, SPOOL_DB: ":memory:", SPOOL_WORKSPACE_MIB: "256", PORT: "0" });
+  runner = await start({ SPOOL_TOKEN: token, SPOOL_DB: ":memory:", SPOOL_WORKSPACE_MIB: "256", PORT: "0",
+    SPOOL_OCI_ENGINE: process.env.SPOOL_OCI_ENGINE, SPOOL_OCI_IMAGE: process.env.SPOOL_OCI_IMAGE });
   const client = createClient({
     url: `http://127.0.0.1:${runner.server.address().port}`,
     headers: { Authorization: `Bearer ${token}` }, layerSource: cache.open,

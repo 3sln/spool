@@ -20,25 +20,28 @@ const workerLimits = (env, direct) => configuredLimits(env, direct
   ? { uploads: ["presigned-put", "presigned-multipart"] }
   : { layerCeiling: 32, defaultLayer: 32 });
 
-let endpoint;
-let endpointEnv;
-export default {
-  fetch(request, env) {
-    if (endpointEnv !== env || !endpoint) {
-      const auth = configuredAuth(env);
-      const transfer = r2Transfers(env);
-      endpoint = publicEndpoint(auth, env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], EXECUTION, (next, tenant) => {
-        const headers = new Headers(next.headers);
-        headers.delete("authorization");
-        headers.delete("cf-access-jwt-assertion");
-        headers.set(tenantHeader, tenant);
-        return env.TENANTS.getByName(tenant).fetch(new Request(next, { headers }));
-      }, workerLimits(env, transfer));
-      endpointEnv = env;
-    }
-    return endpoint(request);
-  },
-};
+export function createWorkerRunner({ auth = configuredAuth } = {}) {
+  const endpoints = new WeakMap();
+  return {
+    fetch(request, env) {
+      let endpoint = endpoints.get(env);
+      if (!endpoint) {
+        const transfer = r2Transfers(env);
+        endpoint = publicEndpoint(auth(env), env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], EXECUTION, (next, tenant) => {
+          const headers = new Headers(next.headers);
+          headers.delete("authorization");
+          headers.delete("cf-access-jwt-assertion");
+          headers.set(tenantHeader, tenant);
+          return env.TENANTS.getByName(tenant).fetch(new Request(next, { headers }));
+        }, workerLimits(env, transfer));
+        endpoints.set(env, endpoint);
+      }
+      return endpoint(request);
+    },
+  };
+}
+
+export default createWorkerRunner();
 
 function stateStorage(storage) {
   return {

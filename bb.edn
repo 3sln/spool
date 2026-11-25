@@ -29,7 +29,7 @@
   test-cluster {:doc "Test two Docker runners over JetStream; start a broker if none is set"
                 :task (tooling/test-cluster)}
   worker-check {:doc "Run Wrangler's Cloudflare build validation"
-                :task (shell "wrangler" "deploy" "--dry-run" "--outdir" ".wrangler/build")}
+                :task (tooling/worker-check)}
   client-emit {:doc "Regenerate JavaScript and Rust client replay code with Kin"
                :task (tooling/emit-client *command-line-args*)}
   release-pack {:doc "Assemble npm packages and write the release checksums"

@@ -11,7 +11,7 @@
     "agent": "node src/agent.mjs",
     "test": "bb test",
     "guest:build": "node bin/runner.mjs guest-build",
-    "worker:check": "wrangler deploy --dry-run --outdir .wrangler/build",
+    "worker:check": "bb worker-check",
     "smoke": "node bin/smoke.mjs",
     "test:worker": "bb test-worker",
     "mcp": "node bin/mcp.mjs",

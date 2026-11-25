@@ -25,11 +25,14 @@ const packages = [
     manifest: {
       name: "@3sln/spool-runner", description: "Self-hosted and Cloudflare runners for the Spool task protocol",
       bin: { "spool-runner": "./bin/runner.mjs" },
-      exports: { ".": "./src/node.mjs", "./worker": "./src/worker.mjs", "./contract": "./src/contract.mjs" },
+      exports: {
+        ".": "./src/node.mjs", "./node": "./src/node.mjs", "./worker": "./src/worker.mjs",
+        "./contract": "./src/contract.mjs", "./guest/Dockerfile": "./guest/Dockerfile",
+      },
       optionalDependencies: source.optionalDependencies,
       dependencies: source.dependencies,
     },
-    files: ["src", "guest/Dockerfile", "guest/Cargo.toml", "guest/Cargo.lock", "guest/src", "guest/.dockerignore", "bin/runner.mjs", "wrangler.jsonc"],
+    files: ["src", "guest/Dockerfile", "guest/Cargo.toml", "guest/Cargo.lock", "guest/src", "guest/.dockerignore", "bin/runner.mjs"],
   },
   {
     manifest: { name: "@3sln/spool-mcp", description: "Stdio MCP client for Spool runners", bin: { "spool-mcp": "./bin/mcp.mjs" } },

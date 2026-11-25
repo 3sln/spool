@@ -21,6 +21,8 @@ The runner can also build the guest with `spool-runner guest-build`.
 
 ## Self-hosted
 
+Embed `start` from `@3sln/spool-runner/node` in a Node or Bun application, or use the optional `spool-runner` CLI. It uses SQLite for coordination, the configured local or S3 layer cache, and an OCI executor. A host application can pass a custom authentication adapter to `start(env, { auth })`.
+
 Use Node 22.13+ or Bun 1.3+ and a Docker engine with Linux/amd64 support. An installed runner starts with `spool-runner serve`. The following commands use the source checkout. On Apple silicon that requires amd64 emulation. Spool ships the portable guest image recipe. The engine and Linux VM are platform dependencies.
 
 ```sh
@@ -143,16 +145,17 @@ Call `wait_task` to satisfy layer requests from disk. Call `task_status` and
 
 ## Cloudflare preview
 
-Cloudflare is a preview adapter. Live probes proved layer application and a fixed composed-root diagnostic, and repeated starts also encountered placement failures. Use a Workers account with Containers and R2 enabled, Wrangler, and a working Docker engine. Configure a private custom domain route or an Access-protected hostname. The supplied Wrangler config disables workers.dev and preview URLs.
+Import the Worker adapter in your own application and export the two Durable Object classes from your Worker entry point.
 
-```sh
-wrangler r2 bucket create spool-layers
-bb worker-check
-wrangler deploy --secrets-file ./secrets.json
-SPOOL_URL=https://<configured-hostname> SPOOL_TOKEN=<same-token> bb smoke
+```js
+import { createWorkerRunner } from "@3sln/spool-runner/worker";
+export { TenantRunner, GuestSlot } from "@3sln/spool-runner/worker";
+export default createWorkerRunner();
 ```
 
-For Access service credentials use `SPOOL_ACCESS_CLIENT_ID` and `SPOOL_ACCESS_CLIENT_SECRET` with the smoke client. The Wrangler config caps the app at four VM instances. A SQLite Durable Object queues one running task per tenant. R2 caches layers by tenant and digest. A separate container-bound object starts a fresh VM per attempt with Internet access disabled. The native guest runs the command independently. Short Durable Object alarms poll logs and results, resume from the persisted cursor, and stop the VM at expiry or completion. The guest also stops when its hard deadline passes or after two minutes without coordinator contact.
+In your application’s config, bind a SQLite Durable Object namespace named `TENANTS` to `TenantRunner` and another named `GUESTS` to the container-backed `GuestSlot`. Bind an R2 bucket as `LAYERS`. The guest image recipe and build context are in the installed runner package under `guest/`. The Dockerfile is also available through `@3sln/spool-runner/guest/Dockerfile`. Configure the app’s routing, auth, and container settings in your deployment. Use `createWorkerRunner({ auth: (env) => adapter })` to supply a custom authentication adapter. For Access service credentials use `SPOOL_ACCESS_CLIENT_ID` and `SPOOL_ACCESS_CLIENT_SECRET` with the smoke client.
+
+A SQLite Durable Object queues one running task per tenant. R2 caches layers by tenant and digest. A separate container-bound object starts a fresh VM per attempt with Internet access disabled. The native guest runs the command independently. Short Durable Object alarms poll logs and results, resume from the persisted cursor, and stop the VM at expiry or completion. The guest also stops when its hard deadline passes or after two minutes without coordinator contact.
 
 Enable direct R2 uploads by setting `SPOOL_R2_ENDPOINT` to your account's R2 S3 API origin and `SPOOL_R2_BUCKET` to the bucket bound as `LAYERS`. Store `SPOOL_R2_ACCESS_KEY_ID` and `SPOOL_R2_SECRET_ACCESS_KEY` as Worker secrets with access scoped to that bucket. The binding manages objects and multipart sessions. The signing key stays in the Worker. Transfers up to 32 MiB use a presigned PUT and larger layers use presigned multipart URLs. A Worker without signing credentials offers gateway PUT for layers up to 32 MiB. Set `SPOOL_TRANSFER_ORIGINS` for the smoke client to use the direct upload origin.
 
@@ -182,7 +185,7 @@ Across hosts, use HTTPS for coordinator calls, a private authenticated TLS conne
 - [JSON Schema](protocol/manifest.schema.json), [OpenAPI](protocol/openapi.yaml), and [wire semantics](protocol/README.md).
 - The execution profile supports Linux/amd64 with a pinned Debian 12 base, a statically linked guest, and ordered USTAR or gzip changesets. Regular files, directories, the executable bit, whiteouts, and opaque directories are supported under `/workspace`. Archive links, PAX extensions, special files and extended attributes are outside the profile.
 - The runner offers a one-hour advisory cache lease and retains task history and idempotency for 24 hours after completion. Artifact downloads currently have a 512 KiB total per-task limit. Full-root composition, larger artifact transfers, warm reuse, and public multi-tenant hardening are separate gates.
-- `bb test` checks the HTTP runner, client cache and SDK, stdio MCP, SQLite, JWT verification and native guest. `bb test-worker` exercises the Worker and SQLite Durable Object in workerd with fixture blob and execution bindings. Set `SPOOL_TOOL_MODULES` to the directory containing the installed workerd and esbuild packages if they are outside the global npm root. `bb worker-check` also requires Docker.
+- `bb test` checks the HTTP runner, client cache and SDK, stdio MCP, SQLite, JWT verification and native guest. `bb test-worker` exercises the Worker and SQLite Durable Object in workerd with fixture blob and execution bindings. Set `SPOOL_TOOL_MODULES` to the directory containing the installed workerd and esbuild packages if they are outside the global npm root. `bb worker-check` generates an ignored test config and runs Wrangler’s dry-run build with Docker.
 
 ## Development and release
 

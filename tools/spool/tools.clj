@@ -22,6 +22,24 @@
            "--external:cloudflare:*" "--outfile=.wrangler/worker.fixture.js")
     (shell workerd "test" (str "-I" modules) "test/worker.capnp")))
 
+(defn worker-check []
+  (fs/create-dirs ".wrangler")
+  (let [config ".wrangler/dry-run.json"]
+    (spit config
+          (json/generate-string
+           {:name "spool-dry-run"
+            :main "../src/worker.mjs"
+            :compatibility_date "2025-11-17"
+            :workers_dev false
+            :preview_urls false
+            :durable_objects {:bindings [{:name "TENANTS" :class_name "TenantRunner"}
+                                         {:name "GUESTS" :class_name "GuestSlot"}]}
+            :migrations [{:tag "v1" :new_sqlite_classes ["TenantRunner" "GuestSlot"]}]
+            :r2_buckets [{:binding "LAYERS" :bucket_name "spool-fixture-layers"}]
+            :containers [{:class_name "GuestSlot" :image "../guest/Dockerfile"
+                          :image_build_context "../guest" :instance_type "standard-2" :max_instances 1}]}))
+    (shell (env "SPOOL_WRANGLER" "wrangler") "deploy" "--config" config "--dry-run" "--outdir" ".wrangler/build")))
+
 (defn emit-client [args]
   (let [paths ["client/kin/src" (env "SPOOL_KIN_SRC" "../kin/src") (env "SPOOL_SNUG_KIN_SRC" "../snug/kin/src")]]
     (apply shell "bb" "--classpath" (str/join java.io.File/pathSeparator paths) "client/kin/emit.clj" args)

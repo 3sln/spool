@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -27,14 +27,25 @@ function run(command, args, options = {}) {
 try {
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", ...install]);
   run(process.execPath, ["--input-type=module", "-e",
-    'import { createClient } from "@3sln/spool"; import { openLayerCache } from "@3sln/spool/node"; import { prepareTaskFile } from "@3sln/spool/taskfile"; import { start } from "@3sln/spool-runner"; if (![createClient, openLayerCache, prepareTaskFile, start].every(x => typeof x === "function")) process.exitCode=1;',
+    'import { createClient } from "@3sln/spool"; import { openLayerCache } from "@3sln/spool/node"; import { prepareTaskFile } from "@3sln/spool/taskfile"; import { start } from "@3sln/spool-runner/node"; if (![createClient, openLayerCache, prepareTaskFile, start].every(x => typeof x === "function")) process.exitCode=1;',
   ]);
   const runner = join(scratch, "node_modules", "@3sln", "spool-runner");
   const mcp = join(scratch, "node_modules", "@3sln", "spool-mcp", "bin", "mcp.mjs");
   assert.equal(run(process.execPath, [join(runner, "bin", "runner.mjs"), "--version"]).trim(), version);
   assert.equal(run(process.execPath, [mcp, "--version"]).trim(), version);
   assert.ok((await stat(join(runner, "guest", "Dockerfile"))).isFile());
-  assert.ok((await stat(join(runner, "wrangler.jsonc"))).isFile());
+  assert.ok(!(await readdir(runner)).some((name) => /^wrangler\./u.test(name)));
+  const esbuild = process.env.SPOOL_ESBUILD ?? (process.env.SPOOL_TOOL_MODULES
+    ? join(process.env.SPOOL_TOOL_MODULES, "esbuild", "bin", "esbuild") : undefined);
+  if (esbuild) {
+    await writeFile(join(scratch, "worker.mjs"), `
+      import { createWorkerRunner } from "@3sln/spool-runner/worker";
+      export { TenantRunner, GuestSlot } from "@3sln/spool-runner/worker";
+      export default createWorkerRunner();
+    `);
+    run(esbuild, ["worker.mjs", "--bundle", "--platform=neutral", "--format=esm",
+      "--external:cloudflare:*", "--outfile=worker.bundle.mjs"]);
+  }
   run(process.execPath, [mcp, "init", "--runner", "https://runner.example", "--state-mode", "isolated"]);
   const config = JSON.parse(await readFile(join(scratch, ".mcp.json"), "utf8"));
   assert.equal(config.mcpServers.spool.command, "spool-mcp");
