@@ -353,3 +353,26 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   await write("task.json", { kind: "task", extends: ["cycle.json"] });
   await assert.rejects(prepareTaskFile(taskfile, { client, cache }), /inheritance cycle/);
 });
+
+test("browser preflights permit configured origins without bypassing task authentication", async (t) => {
+  const data = openData(":memory:");
+  t.after(() => data.close());
+  const handler = nodeHandler(new TaskService(data.store, data.blobs), auth, {
+    origins: ["https://operator.example"],
+  });
+  const origin = "https://operator.example";
+  const preflight = await request(handler, "/v1/tasks", {
+    user: null, method: "OPTIONS", headers: { origin, "access-control-request-method": "POST" },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
+  assert.match(preflight.headers.get("access-control-allow-headers"), /authorization/);
+  const denied = await request(handler, "/v1/tasks", { user: null, method: "POST", headers: { origin } });
+  assert.equal(denied.status, 401);
+  assert.equal(denied.headers.get("access-control-allow-origin"), origin);
+  const foreign = await request(handler, "/v1/tasks", {
+    method: "OPTIONS", headers: { origin: "https://foreign.example", "access-control-request-method": "POST" },
+  });
+  assert.equal(foreign.status, 403);
+  assert.equal(foreign.headers.has("access-control-allow-origin"), false);
+});

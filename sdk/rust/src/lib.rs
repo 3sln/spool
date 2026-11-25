@@ -1,5 +1,6 @@
 //! A blocking client for the Spool 0.1 HTTP binding.
 mod layer;
+#[allow(clippy::needless_return)]
 mod replay;
 
 pub use layer::{Entry, LayerCache, TAR, TAR_GZIP, build_layer, describe};
@@ -283,8 +284,8 @@ impl Client {
                     break;
                 }
                 let bytes = source(descriptor)?;
-                if let Err(error) = self.upload(id, descriptor, &bytes) {
-                    if !matches!(
+                if let Err(error) = self.upload(id, descriptor, &bytes)
+                    && (!matches!(
                         error,
                         Error::Server {
                             status: 403 | 404 | 409,
@@ -294,10 +295,9 @@ impl Client {
                         .status(id)?
                         .required
                         .iter()
-                        .any(|layer| layer.digest == descriptor.digest)
-                    {
-                        return Err(error);
-                    }
+                        .any(|layer| layer.digest == descriptor.digest))
+                {
+                    return Err(error);
                 }
             }
             thread::sleep(
