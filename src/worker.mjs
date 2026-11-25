@@ -5,6 +5,7 @@ import { configuredLimits, readJSON } from "./contract.mjs";
 import { TaskService } from "./service.mjs";
 import { workStream } from "./work-stream.mjs";
 import { r2Transfers } from "./r2-transfer.mjs";
+import { waitForGuest } from "./cloud-startup.mjs";
 
 const EXECUTION = {
   network: "container-internet-disabled", cpu: "vm-one-vcpu-plus-process-rlimit",
@@ -15,7 +16,6 @@ const guestOrigin = "http://spool.internal";
 const tenantHeader = "x-spool-internal-tenant";
 const guestPollMs = 5000;
 const guestIdleMs = 120_000;
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const workerLimits = (env, direct) => configuredLimits(env, direct
   ? { uploads: ["presigned-put", "presigned-multipart"] }
   : { layerCeiling: 32, defaultLayer: 32 });
@@ -198,37 +198,15 @@ export class GuestSlot extends DurableObject {
   }
 
   async startGuest(container, deadline, body) {
-    const port = container.getTcpPort(8080);
-    let ready = false;
-    let lastHealthFailure;
-    let nextStart = 0;
-    let retryDelay = 1000;
-    while (Date.now() < deadline) {
-      if (await this.ctx.storage.get("cancelled")) break;
-      try {
-        // Allow time for each placement attempt before asking the provider to start again.
-        if (!container.running && Date.now() >= nextStart) {
-          nextStart = Date.now() + retryDelay;
-          retryDelay = Math.min(5000, retryDelay * 2);
-          container.start({ enableInternet: false });
-        }
-        const health = await port.fetch(`${guestOrigin}/healthz`, {
-          signal: AbortSignal.timeout(Math.max(1, Math.min(1500, deadline - Date.now()))),
-        });
-        ready = health.status === 204;
-        await health.body?.cancel();
-        if (ready) break;
-        lastHealthFailure = `HTTP ${health.status}`;
-      } catch (error) {
-        lastHealthFailure = error.message;
-      }
-      await delay(500);
-    }
-    if (!ready || deadline <= Date.now() || await this.ctx.storage.get("cancelled")) {
-      throw new Error(lastHealthFailure
-        ? `Guest readiness failed: ${lastHealthFailure}` : "Guest was stopped or did not become ready");
+    const cancelled = () => this.ctx.storage.get("cancelled");
+    let port;
+    try { port = await waitForGuest(container, deadline, cancelled); }
+    catch (error) {
+      console.error("Cloudflare guest startup", error.message, error.cause?.message);
+      throw error;
     }
     await container.setInactivityTimeout(guestIdleMs);
+    if (deadline <= Date.now() || await cancelled()) return new Response(null, { status: 408 });
     return port.fetch(`${guestOrigin}/start`, {
       method: "POST", headers: { "content-type": "application/octet-stream" }, body,
       signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
