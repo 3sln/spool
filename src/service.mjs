@@ -608,7 +608,7 @@ export class TaskService {
         result = { error: "SANDBOX_FAILURE" };
       }
       const paths = job.manifest.outputs?.paths ?? [];
-      let remaining = Math.min(512 * 1024, this.limits.max_artifact_bytes_total);
+      let publishedBytes = 0;
       const artifacts = Array.isArray(result.artifacts) ? result.artifacts.slice(0, paths.length) : [];
       if (!result.error || result.error === "EXECUTION_FAILED") {
         for (const { ready, storage, ...metadata } of Object.values(job.stagedArtifacts ?? {})) {
@@ -617,8 +617,10 @@ export class TaskService {
             url: `/v1/tasks/${job.id}/artifacts/${job.artifacts.length}` };
           event(job, "artifact.ready", artifact);
           job.artifacts.push({ ...artifact, storage });
+          publishedBytes += artifact.size;
         }
       }
+      let remaining = Math.min(512 * 1024, this.limits.max_artifact_bytes_total - publishedBytes);
       for (const raw of artifacts) {
         if (!paths.includes(raw?.path) || job.artifacts.some(({ path }) => path === raw.path)
           || typeof raw.body !== "string" || raw.body.length > Math.ceil(remaining / 3) * 4) continue;
