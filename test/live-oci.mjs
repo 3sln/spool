@@ -70,8 +70,8 @@ id -u`], cwd: "/workspace",
       trace.push(event);
     }
     const task = await waiting;
-    assert.equal(sawLiveLog, true, "Command output should be visible during execution");
     assert.equal(task.state, "SUCCEEDED", JSON.stringify({task,trace}));
+    assert.equal(sawLiveLog, true, "Command output should be visible during execution");
     const artifacts = (await client.artifacts(task.task_id, { signal })).artifacts;
     assert.equal(artifacts.length, 1);
     const expected = `new ${nonce}\npreserved\nreplacement\n`;

@@ -23,6 +23,11 @@ const auth = {
   },
 };
 
+// The host test guest shares the CI account's process limit. The OCI tests
+// exercise commands that spawn subprocesses inside a dedicated sandbox.
+const readValue = 'IFS= read -r value < value.txt || test -n "$value"';
+const writeResult = 'printf %s "$value" > result.txt';
+
 async function assertSucceeded(result, events) {
   if (result.state === "SUCCEEDED") return;
   assert.equal(result.state, "SUCCEEDED", JSON.stringify({ result: result.result, events: await events() }));
@@ -39,7 +44,7 @@ function manifest(client_request_id, layers = []) {
   return {
     protocol_version: "0.1", task_timeout_s: 180, client_request_id, platform: { os: "linux", arch: "amd64" },
     environment: { base: BASE, layers },
-    command: { argv: ["sh", "-c", "cat value.txt; cat value.txt > result.txt"], cwd: "/workspace" },
+    command: { argv: ["sh", "-ec", `${readValue}; printf %s "$value"; ${writeResult}`], cwd: "/workspace" },
     resources: { cpu: 1, memory_mib: 256, disk_mib: 4096, timeout_s: 3 }, network: { mode: "none" },
     outputs: { paths: ["/workspace/result.txt"] },
   };
@@ -106,7 +111,7 @@ test("lazy layers, idempotency, tenant isolation, replay, artifacts and cache ev
   const lower = await fixtureLayer([["value.txt", "hello"], ["obsolete.txt", "remove me"]]);
   const upper = await fixtureLayer([[".wh.obsolete.txt", ""], ["value.txt", "hello from Spool"]], true);
   const spec = manifest("initial", [lower.descriptor, upper.descriptor]);
-  spec.command.argv[2] = "test ! -e obsolete.txt && cat value.txt && cat value.txt > result.txt";
+  spec.command.argv[2] = `test ! -e obsolete.txt; ${spec.command.argv[2]}`;
   const initial = await submit(handler, spec);
   const duplicate = await submit(handler, spec);
   assert.equal(initial.task_id, duplicate.task_id);
@@ -228,7 +233,7 @@ test("client builds a workspace delta, caches its bytes, supplies layers and con
     },
   });
   const spec = manifest("client", [lower, upper]);
-  spec.command.argv[2] = "test ! -e obsolete.txt && cat value.txt > result.txt";
+  spec.command.argv[2] = `test ! -e obsolete.txt; ${readValue}; ${writeResult}`;
   const task = await client.submit(spec);
   const timer = setInterval(() => { void service.run(task.task_id, runGuest); }, 20);
   t.after(() => clearInterval(timer));
@@ -314,7 +319,7 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   const taskfile = join(root, "task.json");
   await write("task.json", {
     kind: "task", extends: ["base.json", "child.json"],
-    command: { argv: ["sh", "-c", "cp value.txt result.txt"] },
+    command: { argv: ["sh", "-ec", `${readValue}; ${writeResult}`] },
     requires: { limits: { max_layers: 1 } },
     outputs: { paths: ["/workspace/result.txt"] },
   });
