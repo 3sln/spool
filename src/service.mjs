@@ -588,6 +588,18 @@ export class TaskService {
     });
   }
 
+  watchDeadline(id) {
+    let checking = false;
+    const timer = setInterval(async () => {
+      if (checking) return;
+      checking = true;
+      try { await this.locked(async () => this.expire(await this.find(id))); }
+      catch (error) { console.error("Execution deadline check failed", id, error.message); }
+      finally { checking = false; }
+    }, 750);
+    return () => clearInterval(timer);
+  }
+
   async run(id, executor) {
     if (this.#running.has(id) || this.#running.size >= this.concurrency) return;
     const controller = new AbortController();
@@ -596,14 +608,7 @@ export class TaskService {
       const work = await this.claim(id);
       if (!work) return;
       if (controller.signal.aborted) return;
-      let checking = false;
-      const watchdog = setInterval(async () => {
-        if (checking || controller.signal.aborted) return;
-        checking = true;
-        try { await this.locked(async () => this.expire(await this.find(id))); }
-        catch (error) { console.error("Execution deadline check failed", id, error.message); }
-        finally { checking = false; }
-      }, 750);
+      const stopWatching = this.watchDeadline(id);
       try {
         let result;
         try {
@@ -615,7 +620,7 @@ export class TaskService {
           result = { error: "SANDBOX_FAILURE" };
         }
         await this.finish(id, work.claim, result);
-      } finally { clearInterval(watchdog); }
+      } finally { stopWatching(); }
     } finally {
       this.#running.delete(id);
     }

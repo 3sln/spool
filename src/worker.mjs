@@ -112,15 +112,19 @@ export class TenantRunner extends DurableObject {
   }
 
   async launch(id, work) {
+    const stopWatching = this.service.watchDeadline(id);
     try {
+      const startupDeadline = Math.min(work.expires, Date.now() + this.service.limits.start_budget_seconds * 1000);
       const response = await this.slot(id, work.claim).fetch(`${internal}/start`, {
         method: "POST", body: workStream(work, (index) => this.service.executionLayer(id, work.claim, index)),
-        headers: { "x-spool-expires": String(work.expires) },
+        headers: { "x-spool-expires": String(work.expires), "x-spool-startup-deadline": String(startupDeadline) },
       });
       if (!response.ok) throw new Error(`Guest start returned ${response.status}`);
     } catch (error) {
       // The request can fail after the guest starts. Recover through the next poll.
       console.error(error.message);
+    } finally {
+      stopWatching();
     }
   }
 
@@ -178,7 +182,9 @@ export class GuestSlot extends DurableObject {
     const used = await this.ctx.storage.get("used");
     if (used) return new Response(null, { status: 409 });
     const expires = Number(request.headers.get("x-spool-expires"));
-    if (!Number.isSafeInteger(expires) || expires <= Date.now()) return new Response(null, { status: 408 });
+    const startupDeadline = Number(request.headers.get("x-spool-startup-deadline"));
+    if (!Number.isSafeInteger(expires) || !Number.isSafeInteger(startupDeadline)
+      || startupDeadline > expires || startupDeadline <= Date.now()) return new Response(null, { status: 408 });
 
     // Reserve this single-use slot before attempting to start the container.
     const started = await this.ctx.blockConcurrencyWhile(async () => {
@@ -188,20 +194,27 @@ export class GuestSlot extends DurableObject {
       return true;
     });
     if (!started) return new Response(null, { status: 409 });
-    return this.startGuest(container, expires, request.body);
+    return this.startGuest(container, startupDeadline, request.body);
   }
 
-  async startGuest(container, expires, body) {
+  async startGuest(container, deadline, body) {
     const port = container.getTcpPort(8080);
-    const deadline = Math.min(expires, Date.now() + 55_000);
     let ready = false;
     let lastHealthFailure;
+    let nextStart = 0;
+    let retryDelay = 1000;
     while (Date.now() < deadline) {
       if (await this.ctx.storage.get("cancelled")) break;
       try {
-        // Provisioning can briefly fail while the preceding VM is being released.
-        if (!container.running) container.start({ enableInternet: false });
-        const health = await port.fetch(`${guestOrigin}/healthz`, { signal: AbortSignal.timeout(1500) });
+        // Allow time for each placement attempt before asking the provider to start again.
+        if (!container.running && Date.now() >= nextStart) {
+          nextStart = Date.now() + retryDelay;
+          retryDelay = Math.min(5000, retryDelay * 2);
+          container.start({ enableInternet: false });
+        }
+        const health = await port.fetch(`${guestOrigin}/healthz`, {
+          signal: AbortSignal.timeout(Math.max(1, Math.min(1500, deadline - Date.now()))),
+        });
         ready = health.status === 204;
         await health.body?.cancel();
         if (ready) break;
@@ -211,14 +224,14 @@ export class GuestSlot extends DurableObject {
       }
       await delay(500);
     }
-    if (!ready || await this.ctx.storage.get("cancelled")) {
+    if (!ready || deadline <= Date.now() || await this.ctx.storage.get("cancelled")) {
       throw new Error(lastHealthFailure
         ? `Guest readiness failed: ${lastHealthFailure}` : "Guest was stopped or did not become ready");
     }
     await container.setInactivityTimeout(guestIdleMs);
     return port.fetch(`${guestOrigin}/start`, {
       method: "POST", headers: { "content-type": "application/octet-stream" }, body,
-      signal: AbortSignal.timeout(Math.max(1, Math.min(600_000, expires - Date.now()))),
+      signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
     });
   }
 
