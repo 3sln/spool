@@ -1,0 +1,14 @@
+{
+  "version": "0.1",
+  "kind": "base",
+  "requires": {
+    "platform": "linux/amd64",
+    "base": "spool-python313-workspace",
+    "features": ["lazy-layers", "artifact-download"],
+    "limits": { "max_layer_bytes": 65536 }
+  },
+  "layers": [
+    { "id": "source", "kind": "directory", "path": "workspace", "exclude": ["__pycache__"] }
+  ],
+  "resources": { "timeout_s": 15 }
+}

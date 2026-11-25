@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+.dev.vars*
+.env*
+.spool/
+__pycache__/
+dist/
+target/
+*.tgz
+.mcp.json.spool-lock
+secrets.json

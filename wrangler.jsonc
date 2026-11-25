@@ -1,0 +1,30 @@
+{
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/configuration/",
+  "name": "spool",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2025-11-17",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": { "SPOOL_AUTH": "token" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "TENANTS", "class_name": "TenantRunner" },
+      { "name": "GUESTS", "class_name": "GuestSlot" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["TenantRunner", "GuestSlot"] }
+  ],
+  "r2_buckets": [
+    { "binding": "LAYERS", "bucket_name": "spool-layers" }
+  ],
+  "containers": [
+    {
+      "class_name": "GuestSlot",
+      "image": "./guest/Dockerfile",
+      "image_build_context": "./guest",
+      "instance_type": "standard-2",
+      "max_instances": 4
+    }
+  ]
+}

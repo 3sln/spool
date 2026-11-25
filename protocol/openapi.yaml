@@ -1,0 +1,202 @@
+openapi: 3.1.0
+info: { title: Spool Portable Task Execution, version: '0.1' }
+security: [{ bearerAuth: [] }, { accessAssertion: [] }]
+paths:
+  /.well-known/portable-task-runner:
+    get:
+      operationId: capabilities
+      security: []
+      responses:
+        '200':
+          description: Platforms, bases, resource limits, authentication and transports.
+          content: { application/json: { schema: { type: object } } }
+  /v1/tasks:
+    post:
+      operationId: submitTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './manifest.schema.json' }
+      responses:
+        '202':
+          description: Durable task accepted or returned for an identical submission.
+          headers: { Location: { schema: { type: string } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }]
+    get:
+      operationId: taskStatus
+      responses:
+        '200':
+          description: Current task state.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/events:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }]
+    get:
+      operationId: taskEvents
+      parameters:
+        - { name: cursor, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: Last-Event-ID, in: header, schema: { type: integer, minimum: 0 } }
+      responses:
+        '200':
+          description: SSE frames containing Event records after the supplied cursor.
+          content: { text/event-stream: { schema: { type: string } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/cancel:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }]
+    post:
+      operationId: cancelTask
+      responses:
+        '200':
+          description: Current task state after cancellation was requested.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/layers/{digest}/upload:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/Digest' }]
+    post:
+      operationId: requestLayerUpload
+      responses:
+        '200':
+          description: Task-bound authenticated PUT capability.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [method, url, expires_at, authenticated]
+                properties:
+                  method: { const: PUT }
+                  url: { type: string, format: uri-reference }
+                  expires_at: { type: string, format: date-time }
+                  authenticated: { const: true }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/layers/{digest}:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/Digest' }]
+    put:
+      operationId: uploadLayer
+      parameters: [{ name: capability, in: query, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '200':
+          description: Layer verified and durable task updated.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/layers/{digest}/retain:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/Digest' }]
+    post:
+      operationId: retainLayer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ttl_s]
+              properties: { ttl_s: { type: integer, minimum: 1, maximum: 3600 } }
+      responses:
+        '200':
+          description: Advisory cache lease. A provider can evict earlier.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [digest, expires_at, guaranteed]
+                properties:
+                  digest: { $ref: './manifest.schema.json#/$defs/digest' }
+                  expires_at: { type: string, format: date-time }
+                  guaranteed: { const: false }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/artifacts:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }]
+    get:
+      operationId: listArtifacts
+      responses:
+        '200':
+          description: Artifacts and authenticated download paths.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [artifacts]
+                properties:
+                  artifacts: { type: array, items: { $ref: '#/components/schemas/Artifact' } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/artifacts/{index}:
+    parameters:
+      - { $ref: '#/components/parameters/TaskId' }
+      - { name: index, in: path, required: true, schema: { type: integer, minimum: 0, maximum: 7 } }
+    get:
+      operationId: downloadArtifact
+      responses:
+        '200':
+          description: Authorized artifact bytes.
+          content: { application/octet-stream: { schema: { type: string, format: binary } } }
+        default: { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+    accessAssertion: { type: apiKey, in: header, name: Cf-Access-Jwt-Assertion }
+  parameters:
+    TaskId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[0-9a-f-]{36}$' }
+    Digest:
+      name: digest
+      in: path
+      required: true
+      schema: { $ref: './manifest.schema.json#/$defs/digest' }
+  responses:
+    Error:
+      description: Request failure.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, message]
+            properties: { error: { type: string }, message: { type: string } }
+  schemas:
+    Task:
+      type: object
+      required: [task_id, state, created_at, deadline, cursor, required, links]
+      properties:
+        task_id: { type: string, pattern: '^[0-9a-f-]{36}$' }
+        state: { enum: [WAITING_FOR_LAYER, QUEUED, RUNNING, SUCCEEDED, FAILED, EXPIRED, CANCELLED] }
+        created_at: { type: string, format: date-time }
+        deadline: { type: string, format: date-time }
+        cursor: { type: integer, minimum: 0 }
+        required:
+          type: array
+          items: { $ref: './manifest.schema.json#/properties/environment/properties/layers/items' }
+        result:
+          type: object
+          properties:
+            exit_code: { type: integer }
+            error: { type: string }
+            retryable: { type: boolean }
+            output_truncated: { type: boolean }
+        links: { type: object, additionalProperties: { type: string, format: uri-reference } }
+    Event:
+      type: object
+      required: [job_id, sequence, type, time, data]
+      properties:
+        job_id: { type: string }
+        sequence: { type: integer, minimum: 1 }
+        type: { type: string }
+        time: { type: string, format: date-time }
+        data: { type: object }
+    Artifact:
+      type: object
+      required: [path, digest, size, media_type, url]
+      properties:
+        path: { type: string }
+        digest: { $ref: './manifest.schema.json#/$defs/digest' }
+        size: { type: integer, minimum: 0 }
+        media_type: { const: application/octet-stream }
+        url: { type: string, format: uri-reference }

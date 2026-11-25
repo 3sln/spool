@@ -1,0 +1,101 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  javascript:
+    name: Node ${{ matrix.node }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        node: [22.14.0, 24.6.0]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+
+  rust:
+    name: Rust SDK and generated policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+      - run: cmp client/generated/rust/spool/client/replay.rs sdk/rust/src/replay.rs
+      - run: cargo +1.92.0 fmt --manifest-path sdk/rust/Cargo.toml --check
+      - run: cargo +1.92.0 test --locked --manifest-path sdk/rust/Cargo.toml
+
+  runners:
+    name: Worker, Docker and JetStream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.6.0
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: rustup toolchain install 1.92.0 --profile minimal
+      - name: Workerd fixture
+        env:
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/spool-tools" --no-audit --no-fund wrangler@4.168.0
+          SPOOL_TOOL_MODULES="$RUNNER_TEMP/spool-tools/node_modules" npm run test:worker
+      - name: Build Linux guest and run both clients
+        env:
+          RUSTUP_TOOLCHAIN: 1.92.0
+          SPOOL_TEST_RUST: '1'
+        run: |
+          npm run guest:build
+          npm run test:oci
+      - name: Distribute Docker jobs over JetStream
+        run: |
+          broker=$(docker run -d --rm -p 127.0.0.1::4222 nats:2.11-alpine -js)
+          trap 'docker stop "$broker" >/dev/null' EXIT
+          export SPOOL_NATS_URL="nats://$(docker port "$broker" 4222/tcp)"
+          npm run test:cluster
+      - name: GitHub package consumer gate
+        run: |
+          npm run release:pack
+          npm run release:check
+
+  verdict:
+    if: always()
+    needs: [javascript, rust, runners]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Required checks
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done

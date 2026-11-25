@@ -1,0 +1,75 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        type: boolean
+        default: false
+        description: 'Create or update a GitHub draft release from main after verification'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spool-release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.6.0
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: rustup toolchain install 1.92.0 --profile minimal
+      - name: Build and install release packages
+        env:
+          RUSTUP_TOOLCHAIN: 1.92.0
+          SPOOL_RELEASE_OCI: '1'
+        run: npm run release:build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spool-release
+          path: dist/
+          if-no-files-found: error
+
+  draft:
+    needs: build
+    if: inputs.draft && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: spool-release
+          path: dist
+      - name: Create or resume draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=$(node -p 'require("./package.json").version')
+          tag="v$version"
+          (cd dist && sha256sum -c SHA256SUMS)
+          if gh release view "$tag" --json isDraft,targetCommitish > /tmp/spool-existing.json; then
+            node -e 'const r=require("/tmp/spool-existing.json"); if (!r.isDraft || r.targetCommitish!==process.env.GITHUB_SHA) process.exit(1)'
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "Spool $version" --draft --prerelease --notes-file CHANGELOG.md
+          fi

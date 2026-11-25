@@ -1,0 +1,14 @@
+(ns spool.client.replay
+  (:require [kin.lang :refer [defn return if]]
+            [spool.client.types :refer [Cursor]]
+            [snug.lang :refer [I32 < <= != -]]))
+
+;; Reject invalid streams, ignore duplicates, deliver exactly the next event,
+;; and ask the host to reconnect from the existing cursor after a gap.
+(defn ^:pub ^I32 replay-decision [^Cursor cursor ^Cursor sequence ^I32 same-task]
+  (if (!= same-task 1) (return -1))
+  (if (< cursor 0) (return -1))
+  (if (<= sequence 0) (return -1))
+  (if (<= sequence cursor) (return 0))
+  (if (!= (- sequence cursor) 1) (return 2))
+  (return 1))

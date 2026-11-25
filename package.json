@@ -1,0 +1,39 @@
+{
+  "name": "@3sln/spool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node src/node.mjs",
+    "agent": "node src/agent.mjs",
+    "test": "node --test test/*.test.mjs",
+    "guest:build": "node bin/runner.mjs guest-build",
+    "worker:check": "wrangler deploy --dry-run --outdir .wrangler/build",
+    "smoke": "node bin/smoke.mjs",
+    "test:worker": "sh bin/test-worker.sh",
+    "mcp": "node bin/mcp.mjs",
+    "client:emit": "sh bin/emit-client.sh",
+    "release:pack": "node release/package.mjs",
+    "release:check": "node release/check.mjs",
+    "release:build": "sh release/build.sh",
+    "test:oci": "node test/live-oci.mjs",
+    "test:cluster": "node test/live-cluster.mjs"
+  },
+  "optionalDependencies": {
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/transport-node": "3.4.0"
+  },
+  "exports": {
+    ".": "./client/index.mjs",
+    "./node": "./client/node.mjs",
+    "./taskfile": "./client/taskfile.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/3sln/spool.git"
+  }
+}
