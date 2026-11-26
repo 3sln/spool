@@ -6,6 +6,7 @@ const config :Workerd.Config = (
       compatibilityDate = "2025-11-17",
       modules = [(name = "worker.fixture.js", esModule = embed "../.wrangler/worker.fixture.js")],
       durableObjectStorage = (inMemory = void),
+      globalOutbound = (name = "spool", entrypoint = "S3Fixture"),
       durableObjectNamespaces = [
         (className = "TestedTenantRunner", uniqueKey = "spool-test-tenant", enableSql = true),
         (className = "GuestFixture", uniqueKey = "spool-test-guest", enableSql = true),

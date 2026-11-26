@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1178.0",
+    "@aws-sdk/xml-builder": "3.972.43",
     "aws4fetch": "1.0.20"
   }
 }

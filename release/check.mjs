@@ -66,6 +66,9 @@ try {
     `);
     run(esbuild, ["worker.mjs", "--bundle", "--platform=neutral", "--format=esm",
       "--external:cloudflare:*", "--outfile=worker.bundle.mjs"]);
+    await writeFile(join(scratch, "worker-s3.mjs"), 'export { default, TenantRunner, GuestSlot } from "@3sln/spool-runner/worker-s3";\n');
+    run(esbuild, ["worker-s3.mjs", "--bundle", "--platform=neutral", "--format=esm",
+      "--external:cloudflare:*", "--outfile=worker-s3.bundle.mjs"]);
     await writeFile(join(scratch, "core.mjs"), 'export * from "@3sln/spool-runner/core";\n');
     run(esbuild, ["core.mjs", "--bundle", "--platform=neutral", "--format=esm", "--outfile=core.bundle.mjs"]);
   }

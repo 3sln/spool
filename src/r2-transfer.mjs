@@ -9,18 +9,29 @@ export function r2Transfers(env) {
   const { SPOOL_R2_ENDPOINT: endpoint, SPOOL_R2_BUCKET: bucket,
     SPOOL_R2_ACCESS_KEY_ID: accessKeyId, SPOOL_R2_SECRET_ACCESS_KEY: secretAccessKey } = env;
   if (![endpoint, bucket, accessKeyId, secretAccessKey].some(Boolean)) return undefined;
-  if (![endpoint, bucket, accessKeyId, secretAccessKey].every(Boolean)) throw new Error("Incomplete R2 upload configuration");
+  if (![endpoint, bucket, accessKeyId, secretAccessKey].every(Boolean)) throw new Error("Incomplete R2 transfer configuration");
   return directTransfers({ endpoint, bucket, accessKeyId, secretAccessKey, region: "auto", driver: env.LAYERS });
 }
 
-export function directTransfers({ endpoint, bucket, accessKeyId, secretAccessKey, credentials, region, driver, hash }) {
+export function objectURLFor(endpoint, bucket) {
   const base = new URL(endpoint);
   if (base.protocol !== "https:" || base.username || base.password || base.pathname !== "/" || base.search || base.hash
     || !/^[a-z0-9.-]+$/u.test(bucket)) throw new Error("Invalid object storage endpoint or bucket");
+  return (key) => new URL([bucket, ...key.split("/").map(encodeURIComponent)].join("/"), base);
+}
+
+export async function hashWorkerStream(body) {
+  const stream = new crypto.DigestStream("SHA-256");
+  const [, digest] = await Promise.all([body.pipeTo(stream), stream.digest]);
+  return Array.from(new Uint8Array(digest), (part) => part.toString(16).padStart(2, "0")).join("");
+}
+
+export function directTransfers({ endpoint, bucket, accessKeyId, secretAccessKey, credentials, region, driver, hash = hashWorkerStream }) {
+  const objectURL = objectURLFor(endpoint, bucket);
   const client = credentials ? undefined : new AwsClient({ accessKeyId, secretAccessKey, region, service: "s3" });
 
   async function signed(key, size, expires, query = {}) {
-    const url = new URL([bucket, ...key.split("/")].map(encodeURIComponent).join("/"), base);
+    const url = objectURL(key);
     for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
     // Uploads sign the expected content length. GETs carry no request body.
     const signer = client ?? new AwsClient({ ...await credentials(), region, service: "s3" });
@@ -66,21 +77,15 @@ export function directTransfers({ endpoint, bucket, accessKeyId, secretAccessKey
         }
         const upload = driver.resumeMultipartUpload(stage.storage, stage.uploadId);
         try { await upload.complete(parts.map(({ number, etag }) => ({ partNumber: number, etag: etag.replaceAll('"', "") }))); }
-        catch { throw new Fault("LAYER_INVALID", "R2 has not accepted every part", 422); }
+        catch { throw new Fault("LAYER_INVALID", "Object storage has not accepted every part", 422); }
       }
       const object = await driver.get(stage.storage);
-      if (!object) throw new Fault("LAYER_UNAVAILABLE", "Upload has not reached R2", 409);
+      if (!object) throw new Fault("LAYER_UNAVAILABLE", "Upload has not reached object storage", 409);
       if (object.size !== descriptor.size) {
         await object.body.cancel();
         throw new Fault("LAYER_INVALID", "Uploaded object has the wrong size", 422);
       }
-      let digest;
-      if (hash) digest = await hash(object.body);
-      else {
-        const stream = new crypto.DigestStream("SHA-256");
-        await Promise.all([object.body.pipeTo(stream), stream.digest]);
-        digest = Array.from(new Uint8Array(await stream.digest), (part) => part.toString(16).padStart(2, "0")).join("");
-      }
+      const digest = await hash(object.body);
       if (`sha256:${digest}` !== descriptor.digest) {
         const error = new Fault("LAYER_INVALID", "Uploaded object failed SHA-256 verification", 422);
         error.replaceUpload = Boolean(stage.uploadId);

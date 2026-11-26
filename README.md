@@ -251,15 +251,31 @@ export { TenantRunner, GuestSlot } from "@3sln/spool-runner/worker";
 export default createWorkerRunner();
 ```
 
-In your application’s config, bind a SQLite Durable Object namespace named `TENANTS` to `TenantRunner` and another named `GUESTS` to the container-backed `GuestSlot`. Bind an R2 bucket as `LAYERS`. The guest image recipe and build context are in the installed runner package under `guest/`. The Dockerfile is also available through `@3sln/spool-runner/guest/Dockerfile`. Configure the app’s routing, auth, and container settings in your deployment. Use `createWorkerRunner({ auth: (env) => adapter })` to supply a custom authentication adapter. For Access service credentials use `SPOOL_ACCESS_CLIENT_ID` and `SPOOL_ACCESS_CLIENT_SECRET` with the smoke client.
+In your application’s config, bind a SQLite Durable Object namespace named `TENANTS` to `TenantRunner` and another named `GUESTS` to the container-backed `GuestSlot`. With the `/worker` entry point, bind an R2 bucket as `LAYERS`. The guest image recipe and build context are in the installed runner package under `guest/`. The Dockerfile is also available through `@3sln/spool-runner/guest/Dockerfile`. Configure the app’s routing, auth, and container settings in your deployment. Use `createWorkerRunner({ auth: (env) => adapter })` to supply a custom authentication adapter. For Access service credentials use `SPOOL_ACCESS_CLIENT_ID` and `SPOOL_ACCESS_CLIENT_SECRET` with the smoke client.
 
 For the Durable Object scheduling policy, configure a named guest image under `containers[].images` and set `SPOOL_CONTAINER_IMAGE` to that name. `SPOOL_CONTAINER_INSTANCE` sets the default for tasks without hints and defaults to `standard-2`. Workers choose the smallest enabled tier that fits a task's minima. Supported tiers are `standard-2`, `standard-3`, and `standard-4`. The runner enables the default tier and larger ones. Set `SPOOL_CONTAINER_INSTANCES` to a comma-separated allowlist that includes the default to restrict which tiers can launch. A deployment using Cloudflare's default scheduling policy has a fixed profile set by its app configuration. [Cloudflare scheduling policy](https://developers.cloudflare.com/containers/configuration/scheduling-policy/)
 
 The selected `resource_profile` reports the workspace disk budget (4 GiB by default) and the tier's usable `capacity`. Request a larger disk budget with `requires.resources.disk_mib`. Stock Workers enforce memory through the VM and stock Docker or Podman through the engine cgroup. The provider caps actual allocation, so runtimes can reserve virtual address space. Cloudflare profile `provisioned` values describe the vCPU, memory and disk quantities for pricing. Cloudflare bills provisioned memory and disk while the Container is active and bills active CPU usage. [Cloudflare Containers pricing](https://developers.cloudflare.com/containers/platform/pricing/)
 
-A SQLite Durable Object queues one running task per tenant. R2 caches layers by tenant and digest. A separate container-bound object starts a fresh VM per attempt with Internet access disabled. The native guest runs the command independently. Short Durable Object alarms poll logs and results, resume from the persisted cursor, and stop the VM at expiry or completion. The guest also stops when its hard deadline passes or after two minutes without coordinator contact.
+A SQLite Durable Object queues one running task per tenant. The storage provider caches layers by tenant and digest. A separate container-bound object starts a fresh VM per attempt with Internet access disabled. The native guest runs the command independently. Short Durable Object alarms poll logs and results, resume from the persisted cursor, and stop the VM at expiry or completion. The guest also stops when its hard deadline passes or after two minutes without coordinator contact.
+
+### Storage through an R2 binding
+
+The binding lets the Worker read, write, and clean up its bucket with Cloudflare-managed access. Gateway transfers work with just the binding. Direct transfers require separate S3 signing credentials. [Cloudflare R2 bindings and presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/)
 
 Enable direct R2 transfers by setting `SPOOL_R2_ENDPOINT` to your account's R2 S3 API origin and `SPOOL_R2_BUCKET` to the bucket bound as `LAYERS`. Store `SPOOL_R2_ACCESS_KEY_ID` and `SPOOL_R2_SECRET_ACCESS_KEY` as Worker secrets with read and write access scoped to that bucket. The binding manages objects and multipart sessions. The signing key stays in the Worker. Layer uploads up to 32 MiB use a presigned PUT, larger layers use presigned multipart URLs, and artifact downloads use presigned GET. A Worker without signing credentials offers gateway PUT for layers up to 32 MiB and authenticated gateway downloads. Set `SPOOL_TRANSFER_ORIGINS` to allow the storage origin for direct transfers.
+
+### Storage through the S3 API
+
+Use the `/worker-s3` entry point for a private S3-compatible bucket. It uses the configured HTTPS S3 endpoint for layers, artifacts, cleanup, and transfer signing. This entry point uses the Workers Fetch and streaming APIs. The `LAYERS` binding is optional for apps using this entry point.
+
+```js
+import { createS3WorkerRunner } from "@3sln/spool-runner/worker-s3";
+export { TenantRunner, GuestSlot } from "@3sln/spool-runner/worker-s3";
+export default createS3WorkerRunner();
+```
+
+Set `SPOOL_S3_BUCKET` and `SPOOL_S3_REGION` (defaults to `us-east-1`). Set `SPOOL_S3_ENDPOINT` to the provider's HTTPS origin for non-AWS storage. The runner uses path-style bucket addressing. Store `SPOOL_S3_ACCESS_KEY_ID` and `SPOOL_S3_SECRET_ACCESS_KEY` as Worker secrets, with `SPOOL_S3_SESSION_TOKEN` when your credentials include a session token. The credentials need read, write, delete, and multipart access to that bucket. Allow the storage origin in the client to use presigned single PUT, multipart, and GET transfers.
 
 ## JetStream workers
 

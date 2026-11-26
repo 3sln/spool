@@ -18,23 +18,25 @@ const guestOrigin = "http://spool.internal";
 const tenantHeader = "x-spool-internal-tenant";
 const guestPollMs = 5000;
 const guestIdleMs = 120_000;
-function workerLimits(env, direct) {
-  const limits = configuredLimits(env, direct
+function workerLimits(env, { layers, artifacts, transfers }) {
+  const limits = configuredLimits(env, transfers
     ? { uploads: ["presigned-put", "presigned-multipart"] }
     : { layerCeiling: 32, defaultLayer: 32 });
-  return { ...limits, ...workerResourcePolicy(env), artifact_layer_sources: true, artifact_presigned_get: Boolean(direct) };
+  return { ...limits, ...workerResourcePolicy(env),
+    artifact_layer_sources: Boolean(artifacts && (layers.importVerified || layers.putVerified)),
+    artifact_presigned_get: typeof artifacts?.presignDownload === "function",
+  };
 }
 
-export function createWorkerRunner({ auth = configuredAuth } = {}) {
+export function createWorkerRunner({ auth = configuredAuth, storage = r2Storage } = {}) {
   const endpoints = new WeakMap();
   return {
     fetch(request, env) {
       let endpoint = endpoints.get(env);
       if (!endpoint) {
-        const transfer = r2Transfers(env);
         endpoint = createRunnerHandler({
           auth: auth(env), origins: env.SPOOL_ALLOWED_ORIGINS?.split(","),
-          execution: EXECUTION, limits: workerLimits(env, transfer),
+          execution: EXECUTION, limits: workerLimits(env, storage(env)),
           dispatch(next, tenant) {
             const headers = new Headers(next.headers);
             headers.delete("authorization");
@@ -84,17 +86,23 @@ function objectStorage(bucket) {
   };
 }
 
+function r2Storage(env) {
+  const transfers = r2Transfers(env);
+  const layers = objectStorage(env.LAYERS);
+  return { transfers, layers, artifacts: {
+    open: layers.open, delete: layers.delete, putVerified: layers.importVerified, presignDownload: transfers?.download,
+  } };
+}
+
 export class TenantRunner extends DurableObject {
+  static storage = r2Storage;
+
   constructor(ctx, env) {
     super(ctx, env);
-    const transfers = r2Transfers(env);
-    const blobs = objectStorage(env.LAYERS);
-    this.service = new TaskService(stateStorage(ctx.storage), blobs, {
-      wake: () => this.schedule(Date.now() + 50), limits: workerLimits(env, transfers), transfers,
-      stop: (id, claim) => this.stop(id, claim), artifactStorage: {
-        open: blobs.open, delete: blobs.delete, putVerified: blobs.importVerified,
-        presignDownload: transfers?.download,
-      },
+    const storage = this.constructor.storage(env);
+    this.service = new TaskService(stateStorage(ctx.storage), storage.layers, {
+      wake: () => this.schedule(Date.now() + 50), limits: workerLimits(env, storage), transfers: storage.transfers,
+      stop: (id, claim) => this.stop(id, claim), artifactStorage: storage.artifacts,
     });
   }
 

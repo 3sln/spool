@@ -29,6 +29,7 @@ const packages = [
       bin: { "spool-runner": "./bin/runner.mjs" },
       exports: {
         ".": "./src/node.mjs", "./node": "./src/node.mjs", "./worker": "./src/worker.mjs",
+        "./worker-s3": "./src/worker-s3.mjs",
         "./core": "./src/core.mjs", "./contract": "./src/contract.mjs", "./guest/Dockerfile": "./guest/Dockerfile",
       },
       optionalDependencies: source.optionalDependencies,

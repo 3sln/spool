@@ -1,5 +1,6 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import worker, { TenantRunner } from "../src/worker.mjs";
+import { workerS3Storage } from "../src/worker-s3.mjs";
 import { BASE, MEDIA, sha256 } from "../src/contract.mjs";
 
 const artifactBytes = new Uint8Array(700 * 1024).fill(37);
@@ -56,6 +57,33 @@ export class BlobBinding extends WorkerEntrypoint {
   async delete(key) { await this.store.delete(key); }
 }
 
+export class S3Fixture extends WorkerEntrypoint {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.origin !== "https://s3.example" || !request.headers.get("authorization")?.startsWith("AWS4-HMAC-SHA256 ")) {
+      return new Response(null, { status: 403 });
+    }
+    const key = url.pathname;
+    const store = this.env.BLOB_DATA.getByName("s3");
+    if (request.method === "POST" && url.searchParams.has("uploads")) {
+      return new Response('<?xml version="1.0"?><InitiateMultipartUploadResult><UploadId>fixture</UploadId></InitiateMultipartUploadResult>');
+    }
+    if (request.method === "PUT") {
+      const bytes = new Uint8Array(await request.arrayBuffer());
+      if (await sha256(bytes) !== `sha256:${request.headers.get("x-amz-content-sha256")}`) return new Response(null, { status: 400 });
+      await store.put(key, bytes);
+      return new Response(null);
+    }
+    if (request.method === "DELETE") {
+      await store.delete(key);
+      return new Response(null, { status: 204 });
+    }
+    const bytes = await store.get(key);
+    if (!bytes) return new Response(null, { status: 404 });
+    return new Response(request.method === "HEAD" ? null : bytes, { headers: { "content-length": String(bytes.length) } });
+  }
+}
+
 export class GuestFixture extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
@@ -88,6 +116,18 @@ export default {
   async test(_controller, env) {
     const bytes = new TextEncoder().encode("tar");
     const digest = await sha256(bytes);
+    const { layers, transfers } = workerS3Storage({
+      SPOOL_S3_ENDPOINT: "https://s3.example", SPOOL_S3_BUCKET: "fixture",
+      SPOOL_S3_ACCESS_KEY_ID: "fixture-key", SPOOL_S3_SECRET_ACCESS_KEY: "fixture-secret",
+    });
+    const { uploadId } = await transfers.create({ storage: "multipart", size: 33 * 1024 ** 2 });
+    if (uploadId !== "fixture") throw new Error("Expected a parsed S3 multipart response");
+    await layers.putVerified("archive", { body: new Response(bytes).body }, { digest, size: bytes.length });
+    if (!await layers.has("archive") || await new Response(await layers.open("archive")).text() !== "tar") {
+      throw new Error("Expected streamed Worker S3 writes and reads");
+    }
+    await layers.delete("archive");
+    if (await layers.has("archive")) throw new Error("Expected Worker S3 deletion");
     const manifest = {
       protocol_version: "0.1", task_timeout_s: 172800, client_request_id: "worker", platform: { os: "linux", arch: "amd64" },
       environment: { base: BASE, layers: [{ digest, size: bytes.length, media_type: MEDIA[0] }] },
