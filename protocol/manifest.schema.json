@@ -49,6 +49,17 @@
       }
     },
     "min_resources": { "$ref": "#/$defs/resourceMinimums" },
+    "layer_sources": {
+      "type": "object", "propertyNames": { "$ref": "#/$defs/digest" }, "maxProperties": 16,
+      "additionalProperties": {
+        "type": "object", "additionalProperties": false, "required": ["task_id", "path"],
+        "properties": { "task_id": { "type": "string", "pattern": "^[0-9a-f-]{36}$" }, "path": { "$ref": "#/$defs/workspacePath" } }
+      }
+    },
+    "shard": {
+      "type": "object", "additionalProperties": false, "required": ["index", "count"],
+      "properties": { "index": { "type": "integer", "minimum": 0, "maximum": 63 }, "count": { "type": "integer", "minimum": 2, "maximum": 64 } }
+    },
     "network": {
       "type": "object", "additionalProperties": false, "required": ["mode"],
       "properties": { "mode": { "const": "none" } }

@@ -72,10 +72,11 @@ export class GuestFixture extends DurableObject {
     if (url.pathname !== "/start") return new Response(null, { status: 404 });
     const payload = await request.text();
     const separator = payload.indexOf("\n");
-    if (payload.slice(separator + 1) !== "tar") throw new Error("Expected bytes forwarded through the R2 adapter");
     const work = JSON.parse(payload.slice(0, separator));
+    if (work.manifest.layer_sources ? payload.slice(separator + 1) !== "%".repeat(artifactBytes.length)
+      : payload.slice(separator + 1) !== "tar") throw new Error("Expected bytes forwarded through the R2 adapter");
     if (request.headers.get("x-spool-resource-profile") !== "standard-3" || work.manifest.resources.cpu !== 2
-      || work.manifest.resources.memory_mib !== 6144 || work.manifest.resources.disk_mib !== 12000) {
+      || work.manifest.resources.memory_mib !== 7936 || work.manifest.resources.disk_mib !== 12000 || !work.container_memory) {
       throw new Error("Expected selected profile and effective guest resources");
     }
     await this.ctx.storage.put("started", true);
@@ -133,5 +134,14 @@ export default {
     if (downloaded.status !== 200 || await sha256(await downloaded.arrayBuffer()) !== await sha256(artifactBytes)) {
       throw new Error("Expected a verified streamed Worker artifact");
     }
+    const artifactDigest = await sha256(artifactBytes);
+    const promoted = await call("/v1/tasks", "POST", JSON.stringify({
+      ...manifest, client_request_id: "worker-artifact",
+      environment: { base: BASE, layers: [{ digest: artifactDigest, size: artifactBytes.length, media_type: MEDIA[0] }] },
+      layer_sources: { [artifactDigest]: { task_id: initial.task_id, path: "/workspace/artifact" } },
+    }));
+    if (promoted.status !== 202) throw new Error(`Artifact layer submit returned ${promoted.status} ${await promoted.text()}`);
+    const chained = await promoted.json();
+    if (chained.state !== "QUEUED" || chained.required.length) throw new Error("Expected artifact layer to queue without an upload");
   },
 };

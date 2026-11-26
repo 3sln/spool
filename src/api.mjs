@@ -65,7 +65,7 @@ export async function taskEndpoint(request, tenant, service) {
     const url = new URL(request.url);
     const { method } = request;
     if (url.pathname === "/v1/tasks" && method === "POST") {
-      const task = await service.submit(tenant, await readJSON(request, service.limits?.max_manifest_bytes));
+      const task = await service.submit(tenant, await readJSON(request, service.limits?.max_manifest_bytes), { signal: request.signal });
       return json(task, 202, { location: task.links.self });
     }
     const [prefix, api, tasks, taskId, sub, item, action, ...rest] = url.pathname.split("/");
@@ -84,8 +84,9 @@ export async function taskEndpoint(request, tenant, service) {
       if (!Number.isSafeInteger(cursor) || cursor < 0) throw new Fault("INVALID_MANIFEST", "Invalid event cursor");
       return await service.events(tenant, taskId, cursor, request.signal);
     }
-    if (sub === "artifacts" && action === undefined && method === "GET" && (item === undefined || /^[0-7]$/u.test(item))) {
-      return await service.artifact(tenant, taskId, item);
+    if (sub === "artifacts" && method === "GET") {
+      if (action === undefined && (item === undefined || /^[0-7]$/u.test(item))) return await service.artifact(tenant, taskId, item);
+      if (action === "download" && /^[0-7]$/u.test(item)) return await service.artifact(tenant, taskId, item, { plan: true });
     }
     if (sub === "layers" && digestPattern.test(item ?? "")) {
       if (action === "upload" && method === "POST") return json(await service.uploadOffer(tenant, taskId, item));

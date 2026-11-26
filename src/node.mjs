@@ -60,6 +60,8 @@ export async function start(env = process.env, overrides = {}) {
   const auth = overrides.auth ?? configuredAuth(env);
   const objectStorage = env.SPOOL_S3_BUCKET ? await (await import("./s3-storage.mjs")).s3Storage(env) : undefined;
   const limits = configuredLimits(env, objectStorage ? { uploads: ["presigned-put", "presigned-multipart"] } : undefined);
+  limits.artifact_layer_sources = true;
+  limits.artifact_presigned_get = Boolean(objectStorage);
   const workers = Number(env.SPOOL_CONCURRENCY ?? 1);
   const port = Number(env.PORT ?? 8787);
   if (!Number.isInteger(workers) || workers < 1 || workers > 64) throw new Error("Invalid SPOOL_CONCURRENCY");
@@ -74,8 +76,16 @@ export async function start(env = process.env, overrides = {}) {
   const data = openData(file);
   const temporary = file === ":memory:" ? await mkdtemp(`${tmpdir()}/spool-blobs-`) : undefined;
   const localBlobs = fileBlobs(temporary ?? `${file}.layers`, data.blobs);
+  const artifacts = objectStorage ? {
+    async open(key) { return await localBlobs.open(key) ?? objectStorage.blobs.open(key); },
+    async delete(key) { await Promise.all([localBlobs.delete(key), objectStorage.blobs.delete(key)]); },
+    putVerified: objectStorage.blobs.putVerified,
+    async presignDownload(key, expires) {
+      if (await objectStorage.blobs.has(key)) return objectStorage.transfers.download(key, expires);
+    },
+  } : localBlobs;
   const service = new TaskService(data.store, objectStorage?.blobs ?? localBlobs, {
-    concurrency: workers, limits, transfers: objectStorage?.transfers, artifactStorage: localBlobs,
+    concurrency: workers, limits, transfers: objectStorage?.transfers, artifactStorage: artifacts,
   });
   const handler = nodeHandler(service, auth, {
     origins: env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], workerAuth, execution: overrides.execution,

@@ -6,6 +6,45 @@ import { BASE, LIMITS, createRunnerCore } from "../src/core.mjs";
 import { directSingleBytes, directTransfers } from "../src/r2-transfer.mjs";
 import { openData } from "../src/sqlite.mjs";
 
+test("artifact plans use a signed GET and keep runner credentials at the runner", async () => {
+  const transfers = directTransfers({
+    endpoint: "https://store.test", bucket: "layers", region: "auto",
+    accessKeyId: "fixture-id", secretAccessKey: "fixture-secret",
+  });
+  const bytes = new TextEncoder().encode("private output");
+  const { digest, size } = await layerDescriptor(bytes, TAR);
+  const expires = Date.now() + 60000;
+  const signed = await transfers.download("artifacts/tenant/task/claim/0", expires);
+  const url = new URL(signed);
+  assert.equal(url.searchParams.get("X-Amz-SignedHeaders"), "host");
+  assert.ok(Number(url.searchParams.get("X-Amz-Expires")) <= 60);
+  assert.equal(await transfers.download("artifacts/expired", Date.now()), undefined);
+  const artifact = { url: "/artifact", download_plan_url: "/artifact/download", size, digest };
+  let calls = [];
+  const options = {
+    url: "https://runner.test", headers: { authorization: "Bearer fixture-token" },
+    async fetch(target, request) {
+      calls.push(target.origin);
+      if (target.origin === url.origin) {
+        assert.equal(target.href, signed);
+        assert.equal(request.headers.get("authorization"), null);
+        assert.equal(request.method, "GET");
+        return new Response(bytes);
+      }
+      assert.equal(request.headers.get("authorization"), "Bearer fixture-token");
+      return target.pathname === artifact.download_plan_url ? Response.json({
+        type: "presigned-get", method: "GET", authenticated: false, size, digest, url: signed,
+      }) : new Response(bytes);
+    },
+  };
+  const direct = createClient({ ...options, allowTransferURL: (target) => target.origin === url.origin });
+  assert.equal(await (await direct.download(artifact)).text(), "private output");
+  assert.deepEqual(calls, ["https://runner.test", "https://store.test"]);
+  calls = [];
+  assert.equal(await (await createClient(options).download(artifact)).text(), "private output");
+  assert.deepEqual(calls, ["https://runner.test", "https://runner.test"]);
+});
+
 test("direct upload plans scope signed parts and require proof of content before queueing", async (t) => {
   const database = openData(":memory:");
   t.after(() => database.close());

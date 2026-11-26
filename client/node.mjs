@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants, createWriteStream, openAsBlob } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
-import { resolve, join } from "node:path";
+import { lstat, mkdir, open, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
+import { resolve, join, posix } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { buildLayer, DEFAULT_LAYER_LIMIT, layerDescriptor, TAR, TAR_GZIP } from "./layers.mjs";
@@ -167,15 +167,17 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
         }
       },
       async resolveBuild(buildKey, build, { signal } = {}) {
+        return cache.resolveBuildDescriptor(buildKey, async () => {
+          const { bytes, mediaType } = await build();
+          return cache.put(bytes, mediaType);
+        }, { signal });
+      },
+      async resolveBuildDescriptor(buildKey, build, { signal } = {}) {
         const key = keyFor(buildKey);
         const index = join(root, ".builds");
         await mkdir(index, { recursive: true, mode: 0o700 });
         return resolveBuild(join(index, key + ".sqlite"),
-          (descriptor) => cache.source(descriptor, { signal }),
-          async () => {
-            const { bytes, mediaType } = await build();
-            return cache.put(bytes, mediaType);
-          }, signal);
+          (descriptor) => cache.open(descriptor, { signal }), build, signal);
       },
       async buildDirectory(directory, options = {}) {
         const prepared = await planDirectoryLayer(directory, options);
@@ -216,39 +218,61 @@ export function buildKey(inputs) {
   return `sha256:${createHash("sha256").update(JSON.stringify(inputs)).digest("hex")}`;
 }
 
-async function snapshot(root, { maxBytes, include, signal }) {
+export function directorySelection({ include, exclude = [] } = {}) {
+  for (const patterns of [include === undefined ? [] : include, exclude]) {
+    if (!Array.isArray(patterns) || patterns.some((pattern) => typeof pattern !== "string"
+      || pattern.includes("\0") || pattern.split("/").some((part) => !part || part === "." || part === ".."))) {
+      throw new TypeError("Directory layer filters must contain relative paths or glob patterns");
+    }
+  }
+  const matches = (patterns, path) => patterns.some((pattern) => posix.matchesGlob(path, pattern));
+  return { include: (path) => !matches(exclude, path), select: (path) => include === undefined || matches(include, path) };
+}
+
+async function snapshot(root, { maxBytes, include, select, signal }) {
   const entries = new Map();
   let remaining = maxBytes;
   if (!(await lstat(root)).isDirectory()) throw new TypeError("Workspace root must be a directory");
-  async function visit(parent = "") {
+  async function visit(parent = "", inherited = false) {
     signal?.throwIfAborted();
+    let found = false;
     for (const name of (await readdir(join(root, parent))).sort()) {
       const path = parent ? `${parent}/${name}` : name;
       if (name === leaseDirectory || !include(path)) continue;
       if (entries.size >= 4096 || path.split("/").length > 32) throw new RangeError("Workspace exceeds the entry or depth limit");
       const full = join(root, path);
       const info = await lstat(full);
+      const selected = inherited || select(path);
       if (info.isDirectory()) {
         entries.set(path, { kind: "directory", path });
-        await visit(path);
+        if (await visit(path, selected) || selected) found = true;
+        else entries.delete(path);
+      } else if (!selected) {
+        continue;
       } else if (info.isFile()) {
         const { bytes, mode } = await boundedFile(full, remaining);
         remaining -= bytes.length;
         entries.set(path, { kind: "file", path, bytes, executable: Boolean(mode & 0o111) });
+        found = true;
+      } else if (info.isSymbolicLink()) {
+        entries.set(path, { kind: "symlink", path, target: await readlink(full) });
+        found = true;
       } else {
-        throw new TypeError(`Unsupported workspace entry: ${path}`);
+        throw new TypeError(`Unsupported workspace entry ${path}: expected a regular file, directory, or relative symlink`);
       }
     }
+    return found;
   }
   await visit();
+  if (entries.size > 4096) throw new RangeError("Workspace exceeds the entry limit");
   return entries;
 }
 
 export async function planDirectoryLayer(directory, {
   previous, maxBytes = DEFAULT_LAYER_LIMIT, snapshotBytes = 32 * 1024 ** 2,
-  include = () => true, signal,
+  include = () => true, select = () => true, signal,
 } = {}) {
-  const options = { maxBytes: snapshotBytes, include, signal };
+  const options = { maxBytes: snapshotBytes, include, select, signal };
   const current = await snapshot(resolve(directory), options);
   const prior = previous ? await snapshot(resolve(previous), options) : new Map();
   const delta = [];
@@ -263,15 +287,16 @@ export async function planDirectoryLayer(directory, {
   for (const [path, entry] of current) {
     const before = prior.get(path);
     if (entry.kind !== before?.kind || (entry.kind === "file"
-      && (entry.executable !== before.executable || !entry.bytes.equals(before.bytes)))) delta.push(entry);
+      && (entry.executable !== before.executable || !entry.bytes.equals(before.bytes)))
+      || (entry.kind === "symlink" && entry.target !== before.target)) delta.push(entry);
   }
   return {
     build: () => buildLayer(delta, { maxBytes }),
     fingerprint() {
       return buildKey(delta.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : a.kind.localeCompare(b.kind))
-        .map(({ kind, path, executable, bytes }) => kind === "file"
+        .map(({ kind, path, executable, bytes, target }) => kind === "file"
           ? [kind, path, executable, bytes.length, createHash("sha256").update(bytes).digest("hex")]
-          : [kind, path]));
+          : kind === "symlink" ? [kind, path, target] : [kind, path]));
     },
   };
 }

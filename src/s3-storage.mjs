@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
 import {
   AbortMultipartUploadCommand, CompleteMultipartUploadCommand, CopyObjectCommand, CreateMultipartUploadCommand,
-  DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, S3Client,
+  DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client,
 } from "@aws-sdk/client-s3";
 import { directTransfers } from "./r2-transfer.mjs";
 
@@ -11,7 +12,7 @@ export async function s3Storage(env) {
   const region = env.SPOOL_S3_REGION ?? env.AWS_REGION ?? "us-east-1";
   const endpoint = env.SPOOL_S3_ENDPOINT ?? `https://s3.${region}.amazonaws.com`;
   const client = new S3Client({ region, endpoint, forcePathStyle: true });
-  const send = (Command, key, extra = {}) => client.send(new Command({ Bucket: bucket, Key: key, ...extra }));
+  const send = (Command, key, extra = {}, options) => client.send(new Command({ Bucket: bucket, Key: key, ...extra }), options);
   const headOrGet = async (Command, key, extra) => {
     try { return await send(Command, key, extra); }
     catch (error) {
@@ -58,6 +59,12 @@ export async function s3Storage(env) {
       has: async (key) => Boolean(await driver.head(key)),
       open: async (key) => (await driver.get(key))?.body,
       delete: (key) => driver.delete(key),
+      async putVerified(key, request, { size, digest }) {
+        await send(PutObjectCommand, key, {
+          Body: request.body ? Readable.fromWeb(request.body) : undefined, ContentLength: size,
+          ChecksumSHA256: Buffer.from(digest.slice(7), "hex").toString("base64"),
+        }, { abortSignal: request.signal });
+      },
     },
   };
 }

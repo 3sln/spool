@@ -26,6 +26,7 @@ function uploadPlan(job, descriptor) {
 function state(job) {
   return {
     task_id: job.id, state: job.state, created_at: job.created_at,
+    ...(job.startedAt && { started_at: new Date(job.startedAt).toISOString() }),
     deadline: new Date(job.deadline).toISOString(),
     task_deadline: new Date(job.taskDeadline ?? job.deadline).toISOString(),
     hard_deadline: new Date(job.hardDeadline ?? job.deadline).toISOString(),
@@ -77,7 +78,40 @@ export class TaskService {
     return job;
   }
 
-  async submit(tenant, manifest) {
+  async importArtifactLayers(tenant, { environment, layer_sources: sources }, admissionDeadline, signal) {
+    if (!sources) return;
+    for (const [digest, { task_id, path }] of Object.entries(sources)) {
+      const producer = await this.find(task_id, tenant);
+      const expiresAt = await this.store.get(historyKey(producer.id));
+      const artifact = producer.artifacts.find((item) => item.path === path);
+      const descriptor = environment.layers.find((item) => item.digest === digest);
+      if (!artifact || expiresAt <= Date.now() || artifact.digest !== digest || artifact.size !== descriptor.size) {
+        throw new Fault("NOT_FOUND", "Matching artifact layer source not found", 404);
+      }
+      const key = cacheKey(tenant, digest);
+      const cached = await this.store.get(leaseKey(key));
+      if (cached && cached.expires > Date.now() && cached.size === descriptor.size
+        && await this.blobs.has(cached.storage ?? key)) {
+        if (cached.expires < admissionDeadline) {
+          await this.store.commit({ [leaseKey(key)]: { ...cached, expires: admissionDeadline } });
+        }
+        continue;
+      }
+      const body = artifact.storage ? await this.artifactStorage?.open(artifact.storage)
+        : Uint8Array.from(atob(artifact.body), (character) => character.charCodeAt(0));
+      if (!body) throw new Fault("NOT_FOUND", "Artifact layer source bytes not found", 404);
+      if (cached) {
+        await this.blobs.delete(cached.storage ?? key);
+        await this.store.commit({}, [leaseKey(key)]);
+      }
+      const write = this.blobs.importVerified ?? this.blobs.putVerified;
+      await write.call(this.blobs, key, { body: body instanceof Uint8Array ? new Response(body).body : body, signal }, descriptor);
+      const expires = Math.max(admissionDeadline, Date.now() + seconds(this.limits.cache_ttl_seconds));
+      await this.store.commit({ [leaseKey(key)]: { size: descriptor.size, expires } });
+    }
+  }
+
+  async submit(tenant, manifest, { signal } = {}) {
     const resourceProfile = planManifest(manifest, this.limits);
     const fingerprint = await sha256(canonical(manifest));
     const raw = (await sha256(canonical([tenant, manifest.client_request_id]))).slice(7, 39);
@@ -99,10 +133,15 @@ export class TaskService {
       const taskDeadline = accepted + seconds(manifest.task_timeout_s);
       const hardDeadline = accepted + seconds(this.limits.max_task_seconds);
       const admissionLimit = accepted + seconds(this.limits.wait_seconds);
+      const deadline = Math.min(taskDeadline, admissionLimit);
+      const transferSignal = manifest.layer_sources && AbortSignal.any([
+        ...(signal ? [signal] : []), AbortSignal.timeout(deadline - accepted),
+      ]);
+      await this.importArtifactLayers(tenant, manifest, deadline, transferSignal);
       const job = {
         id, tenant, fingerprint, envDigest, manifest, resourceProfile, events: [], state: "ACCEPTED",
         created_at: new Date(accepted).toISOString(), taskDeadline, hardDeadline, admissionLimit,
-        deadline: Math.min(taskDeadline, admissionLimit), missing: [], artifacts: [],
+        deadline, missing: [], artifacts: [],
         commandTimeout: manifest.resources.timeout_s ?? this.limits.max_job_seconds,
       };
       event(job, "task.accepted", { request_id: manifest.client_request_id });
@@ -455,12 +494,28 @@ export class TaskService {
     return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-store", "x-accel-buffering": "no" } });
   }
 
-  async artifact(tenant, id, index) {
-    const job = await this.locked(() => this.find(id, tenant));
-    const artifacts = job.artifacts.map(({ body, storage, ...metadata }) => metadata);
+  async artifact(tenant, id, index, { plan = false } = {}) {
+    const { job, expires } = await this.locked(async () => ({
+      job: await this.find(id, tenant), expires: await this.store.get(historyKey(id)),
+    }));
+    if (expires <= Date.now()) throw new Fault("NOT_FOUND", "Task artifacts have expired", 404);
+    const artifacts = job.artifacts.map(({ body, storage, ...metadata }) => ({
+      ...metadata, download_plan_url: `${metadata.url}/download`,
+      ...(expires && { expires_at: new Date(expires).toISOString() }),
+    }));
     if (index === undefined) return json({ artifacts });
     const artifact = job.artifacts[index];
     if (!artifact) throw new Fault("NOT_FOUND", "Artifact not found", 404);
+    if (plan) {
+      // Keep signed URLs short lived and stop minting them within one second of retention expiry.
+      const deadline = Math.min(expires ?? Infinity, Date.now() + seconds(300));
+      const url = artifact.storage && deadline - Date.now() >= 1000
+        ? await this.artifactStorage?.presignDownload?.(artifact.storage, deadline) : undefined;
+      return json({
+        type: url ? "presigned-get" : "http-get", method: "GET", authenticated: !url, url: url ?? artifact.url,
+        size: artifact.size, digest: artifact.digest, expires_at: new Date(deadline).toISOString(),
+      });
+    }
     const body = artifact.storage ? await this.artifactStorage?.open(artifact.storage)
       : Uint8Array.from(atob(artifact.body), (character) => character.charCodeAt(0));
     if (!body) throw new Fault("NOT_FOUND", "Artifact bytes not found", 404);
@@ -583,8 +638,8 @@ export class TaskService {
       job.deadline = Math.min(job.taskDeadline, job.executionLimit);
       event(job, "task.started", { attempt: 1 });
       await this.save(job);
-    const { name, ...allocation } = job.resourceProfile ?? {};
-    const manifest = { ...job.manifest, resources: { ...job.manifest.resources, ...allocation, timeout_s: commandTimeout } };
+      const { name, cpu, memory_mib, disk_mib } = job.resourceProfile ?? job.manifest.resources;
+      const manifest = { ...job.manifest, resources: { cpu, memory_mib, disk_mib, timeout_s: commandTimeout } };
       return { claim: job.claim, expires: Math.min(job.hardDeadline, job.executionLimit), manifest,
         ...(name && { resource_profile: name }),
         ...(this.artifactStorage ? { artifact_limit: this.limits.max_artifact_bytes_total } : {}) };
@@ -654,8 +709,16 @@ export class TaskService {
         return false;
       }
       const error = result.error ?? (result.exit_code === 0 ? undefined : "EXECUTION_FAILED");
+      const { cpu_ms, wall_ms } = result.usage ?? {};
+      const usage = [cpu_ms, wall_ms].every((value) => Number.isSafeInteger(value) && value >= 0) ? { cpu_ms, wall_ms } : undefined;
+      const { index, reason } = result.layer_error ?? {};
+      const layer = Number.isInteger(index) ? job.manifest.environment.layers[index] : undefined;
+      const layer_error = error === "LAYER_INVALID" && typeof reason === "string" ? {
+        ...(layer && { index, digest: layer.digest }), reason: reason.slice(0, 768),
+      } : undefined;
       await this.complete(job, error === "DEADLINE_EXCEEDED" ? "EXPIRED" : error ? "FAILED" : "SUCCEEDED",
-        { exit_code: result.exit_code, error, retryable: false, output_truncated: Boolean(job.logsTruncated || result.output_truncated) });
+        { exit_code: result.exit_code, error, retryable: false, output_truncated: Boolean(job.logsTruncated || result.output_truncated),
+          ...(usage && { usage }), ...(layer_error && { layer_error }) });
       return true;
     });
   }

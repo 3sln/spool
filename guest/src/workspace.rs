@@ -18,8 +18,8 @@ const MAX_ENTRIES: usize = 65_536;
 pub const UID: u32 = 65532;
 const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn parts(name: &str) -> io::Result<Vec<&str>> {
@@ -65,7 +65,10 @@ fn directory(root: &Path, parts: &[String]) -> io::Result<PathBuf> {
     let mut path = root.to_owned();
     for part in parts {
         path.push(part);
-        if path.is_dir() {
+        if path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
             continue;
         }
         remove(&path)?;
@@ -80,6 +83,24 @@ struct Entry {
     directory: bool,
     executable: bool,
     file: Option<PathBuf>,
+    link: Option<String>,
+}
+
+fn link_within(target: &str, mut depth: usize) -> bool {
+    if target.is_empty() || target.starts_with('/') || target.len() > 1024 || target.contains('\0')
+    {
+        return false;
+    }
+    let mut descending = false;
+    for part in target.split('/') {
+        match part {
+            ".." if depth == 0 || descending => return false,
+            ".." => depth -= 1,
+            "." | "" => {}
+            _ => descending = true,
+        }
+    }
+    true
 }
 
 fn extract_layer(root: &Path, input: impl Read, remaining_entries: &mut usize) -> io::Result<()> {
@@ -95,14 +116,33 @@ fn extract_layer(root: &Path, input: impl Read, remaining_entries: &mut usize) -
         let mut member = member?;
         let header = member.header();
         let entry_type = header.entry_type();
-        if (!entry_type.is_file() && !entry_type.is_dir()) || header.link_name_bytes().is_some() {
-            return Err(invalid("unsupported archive entry"));
-        }
         let executable = header.mode()? & 0o111 != 0;
-        let name = member.path_bytes();
+        let name = member.path_bytes().into_owned();
         let name =
             std::str::from_utf8(&name).map_err(|_| invalid("invalid archive path encoding"))?;
-        let path: Vec<_> = parts(name)?.into_iter().map(str::to_owned).collect();
+        let entry_error = |reason: &str| invalid(format!("entry {name:?}: {reason}"));
+        if entry_type.is_pax_global_extensions() && name == "pax_global_header" {
+            if member.size() > 4096 {
+                return Err(entry_error("oversized global archive metadata"));
+            }
+            let extensions = member
+                .pax_extensions()?
+                .ok_or_else(|| invalid("invalid global archive metadata"))?;
+            for extension in extensions {
+                if extension?.key_bytes() != b"comment" {
+                    return Err(entry_error("unsupported global archive metadata key"));
+                }
+            }
+            continue;
+        }
+        if !entry_type.is_file() && !entry_type.is_dir() && !entry_type.is_symlink() {
+            return Err(entry_error("unsupported archive entry type"));
+        }
+        let path: Vec<_> = parts(name)
+            .map_err(|error| entry_error(&error.to_string()))?
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         if path.is_empty() && entry_type.is_dir() && member.size() == 0 {
             continue;
         }
@@ -113,19 +153,37 @@ fn extract_layer(root: &Path, input: impl Read, remaining_entries: &mut usize) -
             || path[0].starts_with(".wh..spool-stage-")
             || (entry_type.is_dir() && member.size() != 0)
         {
-            return Err(invalid("invalid or duplicate archive entry"));
+            return Err(entry_error("invalid or duplicate archive entry"));
         }
+        let link = if entry_type.is_symlink() {
+            let target = header
+                .link_name_bytes()
+                .ok_or_else(|| entry_error("missing symlink target"))?;
+            let target = std::str::from_utf8(&target)
+                .map_err(|_| entry_error("invalid symlink target encoding"))?;
+            if path.last().unwrap().starts_with(".wh.") || !link_within(target, path.len() - 1) {
+                return Err(entry_error(
+                    "symlink target must stay inside the workspace with parent segments before named segments",
+                ));
+            }
+            Some(target.to_owned())
+        } else {
+            if header.link_name_bytes().is_some() {
+                return Err(entry_error("unexpected link metadata"));
+            }
+            None
+        };
         let file = if entry_type.is_file() && !path.last().unwrap().starts_with(".wh.") {
             let destination = stage.path().join(entries.len().to_string());
             let mut file = File::create(&destination)?;
             if io::copy(&mut member, &mut file)? != member.size() {
-                return Err(invalid("incomplete archive entry"));
+                return Err(entry_error("incomplete archive entry"));
             }
             file.flush()?;
             Some(destination)
         } else {
             if member.size() != 0 {
-                return Err(invalid("nonempty whiteout or directory"));
+                return Err(entry_error("nonempty metadata entry"));
             }
             None
         };
@@ -134,6 +192,7 @@ fn extract_layer(root: &Path, input: impl Read, remaining_entries: &mut usize) -
             directory: entry_type.is_dir(),
             executable,
             file,
+            link,
         });
     }
 
@@ -148,10 +207,13 @@ fn extract_layer(root: &Path, input: impl Read, remaining_entries: &mut usize) -
         {
             return Err(invalid("invalid whiteout"));
         }
-        let parent = parents
-            .iter()
-            .fold(root.to_owned(), |path, part| path.join(part));
-        if !parent.is_dir() {
+        let mut parent = root.to_owned();
+        if !parents.iter().all(|part| {
+            parent.push(part);
+            parent
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_dir())
+        }) {
             continue;
         }
         if name == ".wh..wh..opq" {
@@ -176,6 +238,10 @@ fn extract_layer(root: &Path, input: impl Read, remaining_entries: &mut usize) -
         } else {
             let path = directory(root, parents)?.join(name);
             remove(&path)?;
+            if let Some(target) = entry.link {
+                std::os::unix::fs::symlink(target, &path)?;
+                continue;
+            }
             fs::rename(entry.file.ok_or_else(|| invalid("missing payload"))?, &path)?;
             fs::set_permissions(
                 &path,
@@ -237,34 +303,58 @@ fn apply(
     Ok(())
 }
 
-pub fn assemble(root: &Path, work: &Work, mut stream: Option<&mut dyn Read>) -> io::Result<()> {
+pub struct AssemblyError {
+    pub index: Option<usize>,
+    pub reason: String,
+}
+
+impl From<io::Error> for AssemblyError {
+    fn from(error: io::Error) -> Self {
+        Self {
+            index: None,
+            reason: error.to_string(),
+        }
+    }
+}
+
+pub fn assemble(
+    root: &Path,
+    work: &Work,
+    mut stream: Option<&mut dyn Read>,
+) -> Result<(), AssemblyError> {
     if root.read_dir()?.next().is_some() {
-        return Err(invalid("workspace must be empty"));
+        return Err(invalid("workspace must be empty").into());
     }
     let layers = &work.manifest.environment.layers;
     if stream.is_none() && layers.len() != work.layers.len() {
-        return Err(invalid("missing layer"));
+        return Err(invalid("missing layer").into());
     }
     // Leave space for workspace outputs. The provider separately bounds the filesystem.
     let mut bytes_left = u64::from(work.manifest.resources.disk_mib) * 1024 * 1024 * 3 / 4;
     let mut entries_left = MAX_ENTRIES;
     for (index, layer) in layers.iter().enumerate() {
-        if let Some(input) = stream.as_deref_mut() {
-            apply(root, layer, input, &mut bytes_left, &mut entries_left)?;
-        } else {
-            let bytes = STANDARD
-                .decode(&work.layers[index])
-                .map_err(|_| invalid("invalid layer encoding"))?;
-            if bytes.len() != layer.size {
-                return Err(invalid("invalid layer size"));
+        let assembled = (|| {
+            if let Some(input) = stream.as_deref_mut() {
+                apply(root, layer, input, &mut bytes_left, &mut entries_left)
+            } else {
+                let bytes = STANDARD
+                    .decode(&work.layers[index])
+                    .map_err(|_| invalid("invalid layer encoding"))?;
+                if bytes.len() != layer.size {
+                    return Err(invalid("invalid layer size"));
+                }
+                apply(root, layer, &bytes[..], &mut bytes_left, &mut entries_left)
             }
-            apply(root, layer, &bytes[..], &mut bytes_left, &mut entries_left)?;
-        }
+        })();
+        assembled.map_err(|error| AssemblyError {
+            index: Some(index),
+            reason: error.to_string(),
+        })?;
     }
     if let Some(input) = stream {
         let mut tail = [0; 1];
         if input.read(&mut tail)? != 0 {
-            return Err(invalid("unexpected trailing input"));
+            return Err(invalid("unexpected trailing input").into());
         }
     }
     if unsafe { libc::geteuid() } == 0 {
@@ -274,8 +364,8 @@ pub fn assemble(root: &Path, work: &Work, mut stream: Option<&mut dyn Read>) -> 
 }
 
 fn chown_tree(path: &Path) -> io::Result<()> {
-    std::os::unix::fs::chown(path, Some(UID), Some(UID))?;
-    if path.is_dir() {
+    std::os::unix::fs::lchown(path, Some(UID), Some(UID))?;
+    if path.symlink_metadata()?.is_dir() {
         for child in fs::read_dir(path)? {
             chown_tree(&child?.path())?;
         }

@@ -29,6 +29,8 @@ pub struct Work {
     #[serde(default)]
     claim: String,
     artifact_limit: Option<usize>,
+    #[serde(default)]
+    container_memory: bool,
 }
 
 fn no_deadline() -> u64 {
@@ -37,11 +39,19 @@ fn no_deadline() -> u64 {
 
 #[derive(Deserialize)]
 struct Manifest {
+    #[serde(default)]
+    shard: Option<Shard>,
     environment: Environment,
     command: Command,
     resources: Resources,
     #[serde(default)]
     outputs: Outputs,
+}
+
+#[derive(Deserialize)]
+struct Shard {
+    index: u32,
+    count: u32,
 }
 
 #[derive(Deserialize)]

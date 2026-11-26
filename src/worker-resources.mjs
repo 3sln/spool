@@ -3,6 +3,7 @@
 const MiB = 1024 ** 2;
 const profile = (name, cpu, memoryGiB, diskGb) => ({
   name, cpu, memory_mib: memoryGiB * 1024 - 256, disk_mib: Math.floor(diskGb * 10 ** 9 / MiB) - 1024,
+  provisioned: { vcpu: cpu, memory_gib: memoryGiB, disk_gb: diskGb },
 });
 const catalog = [
   profile("standard-2", 1, 6, 12),

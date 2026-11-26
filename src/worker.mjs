@@ -11,7 +11,7 @@ import { workerResourcePolicy } from "./worker-resources.mjs";
 
 const EXECUTION = {
   network: "container-internet-disabled", cpu: "vm-vcpu-plus-process-rlimit",
-  memory: "vm-memory-and-per-process-address-space", disk: "per-file-rlimit-and-vm-disk",
+  memory: "vm-memory", disk: "workspace-input-budget-per-file-rlimit-and-vm-disk",
 };
 const internal = "https://spool.internal";
 const guestOrigin = "http://spool.internal";
@@ -22,7 +22,7 @@ function workerLimits(env, direct) {
   const limits = configuredLimits(env, direct
     ? { uploads: ["presigned-put", "presigned-multipart"] }
     : { layerCeiling: 32, defaultLayer: 32 });
-  return { ...limits, ...workerResourcePolicy(env) };
+  return { ...limits, ...workerResourcePolicy(env), artifact_layer_sources: true, artifact_presigned_get: Boolean(direct) };
 }
 
 export function createWorkerRunner({ auth = configuredAuth } = {}) {
@@ -73,6 +73,13 @@ function objectStorage(bucket) {
       return object?.body ?? (object && new Uint8Array(await object.arrayBuffer()));
     },
     put: (key, bytes) => bucket.put(key, bytes),
+    async importVerified(key, request, { size, digest }) {
+      const stream = new FixedLengthStream(size);
+      await Promise.all([
+        (request.body ?? new Response(new Uint8Array()).body).pipeTo(stream.writable, { signal: request.signal }),
+        bucket.put(key, stream.readable, { sha256: digest.slice(7) }),
+      ]);
+    },
     delete: (key) => bucket.delete(key),
   };
 }
@@ -82,20 +89,12 @@ export class TenantRunner extends DurableObject {
     super(ctx, env);
     const transfers = r2Transfers(env);
     const blobs = objectStorage(env.LAYERS);
-    const artifactStorage = {
-      open: blobs.open,
-      delete: blobs.delete,
-      async putVerified(key, request, { size, digest }) {
-        const stream = new FixedLengthStream(size);
-        await Promise.all([
-          (request.body ?? new Response(new Uint8Array()).body).pipeTo(stream.writable, { signal: request.signal }),
-          env.LAYERS.put(key, stream.readable, { sha256: digest.slice(7) }),
-        ]);
-      },
-    };
     this.service = new TaskService(stateStorage(ctx.storage), blobs, {
       wake: () => this.schedule(Date.now() + 50), limits: workerLimits(env, transfers), transfers,
-      stop: (id, claim) => this.stop(id, claim), artifactStorage,
+      stop: (id, claim) => this.stop(id, claim), artifactStorage: {
+        open: blobs.open, delete: blobs.delete, putVerified: blobs.importVerified,
+        presignDownload: transfers?.download,
+      },
     });
   }
 
@@ -140,7 +139,8 @@ export class TenantRunner extends DurableObject {
     try {
       const startupDeadline = Math.min(work.expires, Date.now() + this.service.limits.start_budget_seconds * 1000);
       const response = await this.slot(id, work.claim).fetch(`${internal}/start`, {
-        method: "POST", body: workStream(work, (index) => this.service.executionLayer(id, work.claim, index)),
+        method: "POST", body: workStream({ ...work, container_memory: true },
+          (index) => this.service.executionLayer(id, work.claim, index)),
         headers: { "x-spool-expires": String(work.expires), "x-spool-startup-deadline": String(startupDeadline),
           ...(work.resource_profile && work.resource_profile !== "fixed" && { "x-spool-resource-profile": work.resource_profile }) },
       });

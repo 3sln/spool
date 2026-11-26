@@ -30,7 +30,7 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn restrict(cpu_seconds: u64, disk_mib: u32, _memory_mib: u32) -> io::Result<()> {
+fn restrict(cpu_seconds: u64, disk_mib: u32, _memory_mib: Option<u32>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
         return Err(io::Error::last_os_error());
@@ -60,8 +60,10 @@ fn restrict(cpu_seconds: u64, disk_mib: u32, _memory_mib: u32) -> io::Result<()>
     set(libc::RLIMIT_CORE, 0, 0)?;
     #[cfg(target_os = "linux")]
     {
-        let address_space = u64::from(_memory_mib) * 1024 * 1024;
-        set(libc::RLIMIT_AS, address_space, address_space)?;
+        if let Some(memory_mib) = _memory_mib {
+            let address_space = u64::from(memory_mib) * 1024 * 1024;
+            set(libc::RLIMIT_AS, address_space, address_space)?;
+        }
         set(libc::RLIMIT_NPROC, 64, 64)?;
     }
     Ok(())
@@ -143,13 +145,21 @@ fn execute_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(shard) = &manifest.shard {
+        child_command
+            .env("SPOOL_SHARD_INDEX", shard.index.to_string())
+            .env("SPOOL_SHARD_COUNT", shard.count.to_string());
+    }
     if unsafe { libc::geteuid() } == 0 {
         // Command clears supplementary groups when a uid is explicitly set.
         child_command.uid(UID).gid(UID);
     }
+    let address_limit = (!work.container_memory).then_some(memory_mib);
     unsafe {
-        child_command.pre_exec(move || restrict(timeout * u64::from(cpu), disk_mib, memory_mib));
+        child_command.pre_exec(move || restrict(timeout * u64::from(cpu), disk_mib, address_limit));
     }
+    let cpu_before = child_cpu_ms();
+    let started = Instant::now();
     let mut child = child_command.spawn()?;
     let pid = child.id() as libc::pid_t;
     let kill_group = || unsafe {
@@ -221,6 +231,10 @@ fn execute_command(
     kill_group();
     let _ = child.wait();
     let (status, expired) = result?;
+    let usage = json!({
+        "wall_ms": started.elapsed().as_millis() as u64,
+        "cpu_ms": child_cpu_ms().saturating_sub(cpu_before),
+    });
     for (index, tail) in pending.iter_mut().enumerate() {
         let text = decode(tail, &[], true);
         if !text.is_empty() {
@@ -233,18 +247,36 @@ fn execute_command(
         .unwrap_or(1);
     if expired {
         return Ok(
-            json!({"error":"DEADLINE_EXCEEDED","exit_code":code,"output_truncated":truncated}),
+            json!({"error":"DEADLINE_EXCEEDED","exit_code":code,"output_truncated":truncated,"usage":usage}),
         );
     }
-    Ok(json!({"exit_code":code,"output_truncated":truncated}))
+    Ok(json!({"exit_code":code,"output_truncated":truncated,"usage":usage}))
+}
+
+fn child_cpu_ms() -> u64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    let usage = unsafe { usage.assume_init() };
+    [usage.ru_utime, usage.ru_stime]
+        .iter()
+        .map(|time| (time.tv_sec as u64) * 1000 + (time.tv_usec as u64) / 1000)
+        .sum()
 }
 
 pub fn prepare(work: &Work, root: &Path, source: Option<&mut dyn Read>) -> Result<(), Value> {
     if now_ms() >= work.expires {
         return Err(json!({"error":"DEADLINE_EXCEEDED"}));
     }
-    if workspace::assemble(root, work, source).is_err() {
-        return Err(json!({"error":"LAYER_INVALID"}));
+    if let Err(failure) = workspace::assemble(root, work, source) {
+        let digest = failure
+            .index
+            .and_then(|index| work.manifest.environment.layers.get(index))
+            .map(|layer| &layer.digest);
+        return Err(json!({"error":"LAYER_INVALID","layer_error":{
+            "index":failure.index,"digest":digest,"reason":failure.reason.chars().take(720).collect::<String>()
+        }}));
     }
     Ok(())
 }

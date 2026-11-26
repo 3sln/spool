@@ -119,6 +119,19 @@ export function createClient({
   }
 
   async function jsonRequest(path, options) { return (await request(path, options)).json(); }
+  async function downloadPlan(artifact, { signal } = {}) {
+    if (!artifact.download_plan_url) {
+      return { type: "http-get", method: "GET", authenticated: artifact.authenticated !== false,
+        url: artifact.url, size: artifact.size, digest: artifact.digest, expires_at: artifact.expires_at };
+    }
+    const plan = await retry(() => jsonRequest(artifact.download_plan_url, { signal }), signal);
+    if (plan?.method !== "GET" || !["http-get", "presigned-get"].includes(plan.type)
+      || plan.authenticated !== (plan.type === "http-get") || typeof plan.url !== "string"
+      || plan.size !== artifact.size || plan.digest !== artifact.digest) {
+      throw new SpoolError("UNSUPPORTED_DOWNLOAD", "Runner returned an invalid artifact download plan");
+    }
+    return plan;
+  }
   const status = (id, { signal } = {}) => {
     const path = taskPath(id);
     return retry(() => jsonRequest(path, { signal }), signal);
@@ -206,9 +219,16 @@ export function createClient({
     },
     cancel: (id, { signal } = {}) => jsonRequest(`${taskPath(id)}/cancel`, { method: "POST", signal }),
     artifacts: (id, { signal } = {}) => jsonRequest(`${taskPath(id)}/artifacts`, { signal }),
-    download: (artifact, { signal } = {}) => request(artifact.url, {
-      transfer: true, authenticated: artifact.authenticated !== false, signal,
-    }),
+    downloadPlan,
+    async download(artifact, { signal } = {}) {
+      const plan = await downloadPlan(artifact, { signal });
+      try {
+        return await request(plan.url, { transfer: true, authenticated: plan.authenticated, signal });
+      } catch (error) {
+        if (plan.type !== "presigned-get" || !(error.code === "UNTRUSTED_URL" || [403, 404].includes(error.status))) throw error;
+        return request(artifact.url, { signal });
+      }
+    },
     supply,
     async wait(id, { source, signal, pollMs = 500 } = {}) {
       for (;;) {

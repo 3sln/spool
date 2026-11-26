@@ -12,6 +12,8 @@ The discovery document reports the auth profile. OAuth runners expose [protected
 
 The manifest's `resources` object carries the runner's baseline profile and optional command timeout. Add `min_resources` with any of `cpu` (whole vCPUs), `memory_mib`, or `disk_mib` to request higher minima. The runner advertises these options in `resource_profiles` on its discovery document. Values in that list describe the supported budgets of each tier. A submission needing an unavailable tier receives HTTP 422 with `RESOURCE_LIMIT` before upload plans are issued. An accepted task can include its selected tier and effective budgets in `resource_profile`. Provider capacity is checked when launching the selected tier. Placement failures stay subject to the startup deadline.
 
+Client-side build requirements are part of a Taskfile layer recipe. The wire manifest carries the final task requirements and the descriptors of the layer bytes the client prepared.
+
 ## Deadlines and states
 
 Every submission supplies a positive `task_timeout_s`. It starts at acceptance and covers layer uploads, queueing, startup, and execution. The runner advertises `limits.max_task_seconds`, which fixes `hard_deadline` at acceptance. The status field `task_deadline` is the requested whole-task deadline. `deadline` is the effective deadline in the current state. While waiting for layers or queueing, it is also bounded by the admission window. An optional `resources.timeout_s` separately limits command runtime. `execution_deadline_limit` gives the latest effective deadline the runner can grant after claiming the task.
@@ -25,6 +27,10 @@ The owning principal can `POST /v1/tasks/{id}/extend` with `{"task_timeout_s":60
 Events are records of `{job_id,sequence,type,time,data}`. The per-task sequence starts at 1. `GET /v1/tasks/{id}/events` tails live events over SSE. Reconnect with `Last-Event-ID` or `cursor` and deduplicate by job ID and sequence. Streams close after about 20 seconds or after terminal replay. Disconnecting leaves the task running. Include `?cursor=0&limit=100` for a JSON page and use `next_cursor` on subsequent calls. `has_more` indicates unread events already available, and `terminal` indicates whether new events can still arrive. Both use the same sequence.
 
 Live `task.stdout` and `task.stderr` events carry UTF-8 chunks and per-channel byte offsets. Spool retains up to 128 KiB or 1,024 log events across the two channels and reports truncation in the terminal result.
+
+When available, `result.usage` gives command wall time and accounted child CPU time in milliseconds. `started_at` starts at the exclusive claim, ahead of sandbox startup. Usage excludes provider startup and archive application and is separate from provider billing. A `LAYER_INVALID` result can include the zero-based layer index, digest, and extraction error in `result.layer_error`.
+
+Runners advertising `task-shards` accept an optional `shard` with `index` and `count`. Each shard has its own request ID, task ID, deadline, and outcome. The command receives `SPOOL_SHARD_INDEX` and `SPOOL_SHARD_COUNT`.
 
 ## Layer transfers
 
@@ -42,7 +48,11 @@ The cache is scoped to the tenant and can be evicted. The executor verifies the 
 
 ## Artifacts
 
-The runner collects declared regular files in manifest order within the combined `limits.max_artifact_bytes_total` budget. An output that is absent or exceeds the remaining budget is omitted. Artifact listings include the path, byte size, SHA-256 and an authenticated download URL. Downloads are raw byte streams with a `Content-Length` header. They require the owning principal and expire with task history.
+The runner collects declared regular files from the final workspace within the combined `limits.max_artifact_bytes_total` budget. An output that is absent or exceeds the remaining budget is omitted. Artifact listings include the path, byte size, SHA-256, authenticated download URL and expiry. Downloads are raw byte streams with a `Content-Length` header. They require the owning principal and expire with task history. The stock Workers runner stores outputs in R2. The stock Node runner stores them on disk or in its configured S3 bucket.
+
+Make an authenticated GET to the artifact's `download_plan_url` for a plan. A `presigned-get` uses a short-lived HTTPS URL for a direct object-storage GET. Follow it only on an allowed transfer origin and omit runner credentials. Signed URLs last up to five minutes and cannot outlive the artifact. An `http-get` uses the same-origin authenticated gateway. The plan echoes the expected digest and size so clients can verify the response stream. Discovery advertises the supported `download_transports`.
+
+On runners advertising `artifact-layer-source`, the consumer can submit `layer_sources` keyed by a layer descriptor's digest. Each value contains the owning task's `task_id` and absolute workspace artifact `path`. The artifact must match the descriptor's digest and size, be available to the same tenant, and contain an accepted archive. Its bytes are copied within runner storage and verified, ready for ordinary cache reuse.
 
 ## Client transport
 

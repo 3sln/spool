@@ -11,7 +11,7 @@ const minimumZero = new Set(["max_layers", "max_logs_bytes", "max_log_events", "
   "max_artifact_bytes_total"]);
 const ceilings = { ...LIMITS, max_layer_bytes: 2048 * 1024 ** 2, max_input_bytes: 8192 * 1024 ** 2,
   workspace_mib: 8192, max_job_seconds: 2_147_483, max_task_seconds: 2_147_483, wait_seconds: 86400,
-  max_artifact_bytes_total: 1024 ** 3 };
+  max_artifact_bytes_total: 1024 ** 3, history_ttl_seconds: 2_147_483 };
 
 function methods(provider, name, required) {
   for (const method of required) {
@@ -58,7 +58,9 @@ export function createRunnerHandler({ auth, execution, limits, origins = [], dis
 export function createRunnerCore({
   auth, execution, store, layers, artifacts, transfers, limits = {}, origins, concurrency = 1, wake, stop,
 }) {
-  const policy = providerLimits(limits, transfers, artifacts);
+  const policy = Object.freeze({ ...providerLimits(limits, transfers, artifacts),
+    artifact_layer_sources: Boolean(artifacts && typeof layers?.putVerified === "function"),
+    artifact_presigned_get: typeof artifacts?.presignDownload === "function" });
   methods(store, "store", ["get", "list", "commit"]);
   methods(layers, "layers", ["has", "delete"]);
   methods(layers, "layers", [typeof layers.open === "function" ? "open" : "get"]);

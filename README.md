@@ -44,7 +44,7 @@ Tasks run offline with loopback available. Prepare dependencies, tools, and inpu
 
 The self-hosted runner defaults to 512 MiB per layer, 2 GiB of uploaded layers per task, and a 4 GiB workspace. Set `SPOOL_MAX_LAYER_MIB`, `SPOOL_MAX_INPUT_MIB`, and `SPOOL_WORKSPACE_MIB` to match the host and workload. The runner rejects unsupported declared sizes at submission. Expanded archive bytes have a separate budget equal to three quarters of workspace capacity. `SPOOL_ADMISSION_SECONDS` sets the upload and queue window, and `SPOOL_STARTUP_SECONDS` sets the sandbox startup allowance. The default tmpfs workspace uses host memory as it fills. For a disk-backed workspace use `SPOOL_WORKSPACE_DRIVER=quota` on an engine with a configured storage quota.
 
-Set `SPOOL_S3_BUCKET` to use an existing private S3-compatible bucket for the layer cache. Use the AWS SDK credential chain on the coordinator and configure `SPOOL_S3_REGION` and an optional HTTPS `SPOOL_S3_ENDPOINT`. The coordinator signs direct PUT and multipart upload URLs and verifies objects before admitting them to the cache. The filesystem and S3 backends both feed verified bytes to the executor in order.
+Set `SPOOL_S3_BUCKET` to use an existing private S3-compatible bucket for layers and output artifacts. Use the AWS SDK credential chain on the coordinator and configure `SPOOL_S3_REGION` and an optional HTTPS `SPOOL_S3_ENDPOINT`. The coordinator issues signed uploads and direct artifact download plans. The filesystem and S3 backends both feed verified bytes to the executor in order.
 
 ## Authentication
 
@@ -92,7 +92,7 @@ const task = await client.submit({
 const outcome = await client.wait(task.task_id);
 ```
 
-Pass `previous` to build a directory delta against a prior snapshot. Reproducible tar layers use normalized ownership, timestamps, and executable modes. The byte builder also accepts explicit directory, file, whiteout, and opaque entries. For large prepared archives use `cache.importFile(path, mediaType)` and `layerSource: cache.open` to upload from disk. Prepare toolchains and dependencies in a compatible build environment before packaging them. The cache verifies reads against the manifest descriptor.
+Pass `previous` to build a directory delta against a prior snapshot. Reproducible tar layers use normalized ownership, timestamps, and executable modes. The byte builder also accepts explicit directory, file, symlink, whiteout, and opaque entries. For large prepared archives use `cache.importFile(path, mediaType)` and `layerSource: cache.open` to upload from disk. The cache verifies reads against the manifest descriptor.
 
 ### Client layer leases
 
@@ -118,6 +118,21 @@ Check in [a task](examples/taskfiles/check.json), [a reusable base](examples/tas
 
 Set `requires.resources` on a task or base when it needs more CPU, memory, or workspace disk than the defaults. For example, `"requires": { "resources": { "cpu": 2, "memory_mib": 4096, "disk_mib": 8192 } }`. The compiler checks the runner's advertised profiles before building layers. The runner independently checks the submitted minima before accepting the task. Task status reports the selected profile and effective budgets.
 
+Each locally built container layer can declare separate `build_resources`. Spool checks the local engine's CPU and memory capacity and the scratch filesystem's free space on a cache miss. Set `SPOOL_BUILD_ENGINES` to an ordered list such as `podman,docker` and `SPOOL_BUILD_TMPDIR` to a directory shared with the engine. Preload the image for Linux/amd64. The build runs offline with a read-only snapshot at `/inputs.tar` and writes its layer to `/build/layer.tar`. Build minimums stay on the client. They never enter the submitted task manifest.
+
+```json
+{
+  "id": "prepared",
+  "kind": "docker",
+  "path": "build-input",
+  "image": "debian:bookworm-slim@sha256:311f7a192fd9a92b165a86b32fa3aae9005b11849bfb1db2d4fd784559ee464f",
+  "argv": ["/bin/sh", "-ec", "tar -xf /inputs.tar; sh prepare.sh; tar --format=ustar -cf layer.tar -C output ."],
+  "build_resources": { "cpu": 2, "memory_mib": 4096, "disk_mib": 8192 }
+}
+```
+
+SDK callers can choose build engines with `buildEngines`. Custom layer builders receive declared `buildResources` in their build context.
+
 Call the library to resolve runner capabilities, build the ordered layers, and merge their SHA-256 descriptors into the manifest.
 
 ```js
@@ -132,7 +147,23 @@ const { task } = await runTaskFile("./examples/taskfiles/check.json", {
 
 The runner returns any missing digests and an upload plan for each. The client reads those exact bytes from its cache and follows the plan. The runner starts after every layer has been verified. Retries use the same request ID and manifest. A caller can persist the accepted task ID and resume waiting with the same client cache. Use `prepareTaskFile` for the merged manifest and descriptors without submitting.
 
-Paths resolve relative to the file declaring them and stay inside the caller's context root. Directory recipes accept a `previous` snapshot and optional subtree exclusions. Archive recipes import prebuilt OCI bytes. The client fingerprints directory content and indexes each built layer by the recipe version, platform, base, ordered parent digests, and normalized inputs. Separate projects with the same prefix and local cache share one build, even when their checkout paths or layer IDs differ. A per-key SQLite lock coordinates the processes and releases when a builder exits. The actual archive SHA-256 stays in the manifest for uploads and verification.
+Paths resolve relative to the file declaring them and stay inside the caller's context root. Directory recipes accept a `previous` snapshot and optional `include` and `exclude` lists of paths or globs relative to the layer directory. For example, `"include": ["src", "docs/**/*.json"], "exclude": ["**/fixtures", ".git"]` selects source and JSON input files. A matched directory includes or excludes its subtree. The same filters apply to both sides of a delta. Archive recipes import prebuilt OCI bytes.
+
+Keep large stable inputs in lower layers and frequently edited scripts or patches in upper layers. The client fingerprints directory content and indexes each built layer by the recipe version, platform, base, ordered parent digests, and normalized inputs. Separate projects with the same prefix and local cache share one build, even when their checkout paths or layer IDs differ. A per-key SQLite lock coordinates the processes and releases when a builder exits. The actual archive SHA-256 stays in the manifest for uploads and verification.
+
+### Prepare Linux binaries and reuse build outputs
+
+Tasks run offline on Linux/amd64. For pure Go on macOS, run `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o .cache/spool/bin/tool ./cmd/tool` and add `.cache/spool` as a directory layer. For CGO or native dependencies, build in a Linux/amd64 environment compatible with the Debian 12 base. Discovery's `base_packages` lists the pinned base's Debian package versions. Check those versions and the runner's layer limits before packaging add-on toolchains.
+
+To build once and run a binary in later tasks, have the producer write an archive such as `tar --format=ustar -cf /workspace/tool.tar -C /workspace/out bin` and declare `/workspace/tool.tar` in `outputs.paths`. The consumer can include this recipe on the same runner and profile while the producer's history is retained.
+
+```json
+{ "id": "tool", "kind": "artifact", "task_id": "PRODUCER_TASK_ID", "path": "/workspace/tool.tar" }
+```
+
+The runner verifies and caches the archive without sending its bytes through the client. Use `media_type` for gzip archives. Discovery advertises `artifact-layer-source` when available.
+
+Use `"outputs": {"paths": ["/workspace/report.json", "/workspace/results.tar"]}` to keep files from the final workspace. For directories, create an archive in the task and declare that file. Artifacts are private to the submitting tenant and expire after 24 hours by default. Set `SPOOL_HISTORY_TTL_SECONDS` on the runner to change retention. Listings include the size, digest, expiry, and a download plan endpoint. Clients with an allowed storage origin use the runner's short-lived presigned GET when available.
 
 Register additional recipe kinds with `layerBuilders`. A function receives the recipe and the build context. To share builds, supply an object with `version`, `fingerprint(recipe, context)`, and `build(recipe, context)`. The fingerprint must include all remaining inputs that affect the bytes, including tool versions or option values, and describe the exact inputs used by the build. The context includes the selected platform and base, ordered parent descriptors, runner capabilities, and a scoped path resolver.
 
@@ -152,8 +183,14 @@ The default writes `.mcp.json`. Use `--client cursor` for `.cursor/mcp.json`,
 server entry. Existing entries are preserved. Use `--force` to replace a
 conflicting Spool entry. Configure a local authentication profile or pass
 `SPOOL_TOKEN` in the MCP host environment. The generated config contains
-startup arguments and may name a profile.
-Set `SPOOL_TRANSFER_ORIGINS` to a comma-separated list of allowed HTTPS storage origins for direct uploads.
+startup arguments and may name a profile. Keep machine-specific entries with
+absolute paths or local profile names out of version control, and add
+`.spool-leases/` to your project's ignore file. Claude Code prompts for
+approval for project-scoped servers. To register across projects in Claude
+Code, run `spool-mcp init --client claude --scope user --profile NAME`. The
+adapter uses Claude's current project directory when no workspace is passed.
+[Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#mcp-installation-scopes)
+Set `SPOOL_TRANSFER_ORIGINS` to a comma-separated list of allowed HTTPS storage origins for direct uploads and downloads.
 
 Shared mode uses a per-user local disk cache so separate stdio processes share
 both completed layers and in-flight builds. Use `--state-mode isolated` for a cache that is removed
@@ -167,10 +204,9 @@ manage its current references. Set `SPOOL_CACHE_LEASE_SECONDS` to override the
 default duration. Run `spool-mcp cache-gc` or call `gc_layer_cache` to reclaim
 unleased layers. Pass `--state-dir PATH` to the command for a custom cache.
 
-`submit_template` compiles a checked-in Taskfile under the workspace root.
-Call `wait_task` to satisfy layer requests from disk. Call `task_status` and
-`task_events` to inspect progress, then `extend_task` to request a later deadline. Use
-`task_artifacts` and `read_artifact` to retrieve results up to 512 KiB through MCP. Use a client library for larger files.
+Run `spool-mcp capabilities --profile NAME` before connecting MCP to see the live runner's base packages, profiles, and limits. `submit_template` compiles a Taskfile under the workspace root. Pass `shards: 4` to run four tasks with the same layers and zero-based `SPOOL_SHARD_INDEX` and `SPOOL_SHARD_COUNT` in their environment. Wait on each returned ID. If a batch is partially accepted, finish the accepted tasks and repeat with the returned `client_request_id` to resume the batch.
+
+Call `wait_task` to satisfy layer requests from disk. It waits for up to 100 seconds per call, then returns current status. Call `task_status` and `task_events` to inspect progress. Use `extend_task` to request a later deadline. `read_artifact` can return artifacts up to 512 KiB as UTF-8 or base64. `download_artifact` streams larger files into the workspace and verifies their digests.
 
 ### Authentication profiles
 
@@ -217,11 +253,13 @@ export default createWorkerRunner();
 
 In your application’s config, bind a SQLite Durable Object namespace named `TENANTS` to `TenantRunner` and another named `GUESTS` to the container-backed `GuestSlot`. Bind an R2 bucket as `LAYERS`. The guest image recipe and build context are in the installed runner package under `guest/`. The Dockerfile is also available through `@3sln/spool-runner/guest/Dockerfile`. Configure the app’s routing, auth, and container settings in your deployment. Use `createWorkerRunner({ auth: (env) => adapter })` to supply a custom authentication adapter. For Access service credentials use `SPOOL_ACCESS_CLIENT_ID` and `SPOOL_ACCESS_CLIENT_SECRET` with the smoke client.
 
-For the [Durable Object scheduling policy](https://developers.cloudflare.com/containers/configuration/scheduling-policy/), configure a named guest image under `containers[].images` and set `SPOOL_CONTAINER_IMAGE` to that name. `SPOOL_CONTAINER_INSTANCE` sets the default for tasks without hints and defaults to `standard-2`. Workers choose the smallest enabled tier that fits a task's minima. Supported tiers are `standard-2`, `standard-3`, and `standard-4`. By default, the runner enables the default tier and larger ones. Set `SPOOL_CONTAINER_INSTANCES` to a comma-separated allowlist that includes the default to restrict which tiers can launch. The advertised budgets reserve 256 MiB of VM memory and 1 GiB of disk for overhead. The guest applies the effective task address-space and workspace budgets. A deployment using Cloudflare's default scheduling policy has a fixed profile set by the app configuration.
+For the Durable Object scheduling policy, configure a named guest image under `containers[].images` and set `SPOOL_CONTAINER_IMAGE` to that name. `SPOOL_CONTAINER_INSTANCE` sets the default for tasks without hints and defaults to `standard-2`. Workers choose the smallest enabled tier that fits a task's minima. Supported tiers are `standard-2`, `standard-3`, and `standard-4`. The runner enables the default tier and larger ones. Set `SPOOL_CONTAINER_INSTANCES` to a comma-separated allowlist that includes the default to restrict which tiers can launch. A deployment using Cloudflare's default scheduling policy has a fixed profile set by its app configuration. [Cloudflare scheduling policy](https://developers.cloudflare.com/containers/configuration/scheduling-policy/)
+
+The selected `resource_profile` reports the workspace disk budget (4 GiB by default) and the tier's usable `capacity`. Request a larger disk budget with `requires.resources.disk_mib`. Stock Workers enforce memory through the VM and stock Docker or Podman through the engine cgroup. The provider caps actual allocation, so runtimes can reserve virtual address space. Cloudflare profile `provisioned` values describe the vCPU, memory and disk quantities for pricing. Cloudflare bills provisioned memory and disk while the Container is active and bills active CPU usage. [Cloudflare Containers pricing](https://developers.cloudflare.com/containers/platform/pricing/)
 
 A SQLite Durable Object queues one running task per tenant. R2 caches layers by tenant and digest. A separate container-bound object starts a fresh VM per attempt with Internet access disabled. The native guest runs the command independently. Short Durable Object alarms poll logs and results, resume from the persisted cursor, and stop the VM at expiry or completion. The guest also stops when its hard deadline passes or after two minutes without coordinator contact.
 
-Enable direct R2 uploads by setting `SPOOL_R2_ENDPOINT` to your account's R2 S3 API origin and `SPOOL_R2_BUCKET` to the bucket bound as `LAYERS`. Store `SPOOL_R2_ACCESS_KEY_ID` and `SPOOL_R2_SECRET_ACCESS_KEY` as Worker secrets with access scoped to that bucket. The binding manages objects and multipart sessions. The signing key stays in the Worker. Transfers up to 32 MiB use a presigned PUT and larger layers use presigned multipart URLs. A Worker without signing credentials offers gateway PUT for layers up to 32 MiB. Set `SPOOL_TRANSFER_ORIGINS` for the smoke client to use the direct upload origin.
+Enable direct R2 transfers by setting `SPOOL_R2_ENDPOINT` to your account's R2 S3 API origin and `SPOOL_R2_BUCKET` to the bucket bound as `LAYERS`. Store `SPOOL_R2_ACCESS_KEY_ID` and `SPOOL_R2_SECRET_ACCESS_KEY` as Worker secrets with read and write access scoped to that bucket. The binding manages objects and multipart sessions. The signing key stays in the Worker. Layer uploads up to 32 MiB use a presigned PUT, larger layers use presigned multipart URLs, and artifact downloads use presigned GET. A Worker without signing credentials offers gateway PUT for layers up to 32 MiB and authenticated gateway downloads. Set `SPOOL_TRANSFER_ORIGINS` to allow the storage origin for direct transfers.
 
 ## JetStream workers
 
@@ -247,7 +285,7 @@ Across hosts, use HTTPS for coordinator calls, a private authenticated TLS conne
 ## Contract and verification
 
 - [JSON Schema](protocol/manifest.schema.json), [OpenAPI](protocol/openapi.yaml), and [wire semantics](protocol/README.md).
-- The execution profile supports Linux/amd64 with a pinned Debian 12 base, a statically linked guest, and ordered USTAR or gzip changesets. Regular files, directories, the executable bit, whiteouts, and opaque directories are supported under `/workspace`. Archive links, PAX extensions, special files and extended attributes are outside the profile.
+- The execution profile supports Linux/amd64 with a pinned Debian 12 base, a statically linked guest, and ordered USTAR or gzip changesets. Regular files, directories, the executable bit, workspace-contained relative symlinks, whiteouts, opaque directories, and the Git archive PAX commit comment are supported. Other PAX extensions, hardlinks, special files and extended attributes are outside the profile.
 - The runner offers a one-hour advisory cache lease and retains task history and idempotency for 24 hours after completion. Declared outputs stream up to a combined 256 MiB per task by default. Set `SPOOL_MAX_ARTIFACT_MIB` to an integer from 0 to 1024 to adjust that budget. Use the JavaScript download response stream or Rust `download_to` to save large files. Full-root composition, warm reuse, and public multi-tenant hardening remain open.
 - `bb test` checks the HTTP runner, client cache and SDK, stdio MCP, SQLite, JWT verification and native guest. `bb test-worker` exercises the Worker and SQLite Durable Object in workerd with fixture blob and execution bindings. Set `SPOOL_TOOL_MODULES` to the directory containing the installed workerd and esbuild packages if they are outside the global npm root. `bb worker-check` generates an ignored test config and runs Wrangler’s dry-run build with Docker.
 

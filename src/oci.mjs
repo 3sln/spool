@@ -9,7 +9,7 @@ export const defaultGuestImage = `spool-guest:${pkg.version}`;
 
 export const EXECUTION = {
   network: "engine-network-none-with-loopback", cpu: "engine-quota",
-  memory: "engine-cgroup-and-process-address-space", disk: "workspace-tmpfs-or-engine-storage-quota",
+  memory: "engine-cgroup-including-workspace-tmpfs", disk: "workspace-tmpfs-or-engine-storage-quota",
 };
 
 export function engineCommand(engine, args, { input, signal, timeout = 25_000, consume } = {}) {
@@ -63,7 +63,7 @@ export function ociExecutor(env) {
     const quota = workspaceDriver === "quota";
     const memory = quota ? 384 : 384 + workspace;
     const mounts = quota ? ["--storage-opt", `size=${workspace}m`] :
-      ["--read-only", "--tmpfs", `/workspace:rw,nosuid,nodev,size=${workspace}m,mode=1777`];
+      ["--read-only", "--tmpfs", `/workspace:rw,exec,nosuid,nodev,size=${workspace}m,mode=1777`];
     try {
       if (signal.aborted) return { error: "CANCELLED" };
       await engineCommand(engine, [
@@ -76,7 +76,7 @@ export function ociExecutor(env) {
       ]);
       if (signal.aborted) return { error: "CANCELLED" };
       return await engineCommand(engine, ["start", "--attach", "--interactive", name], {
-        input: workChunks(work, readLayer), signal, timeout: Math.max(1, work.expires - Date.now()),
+        input: workChunks({ ...work, container_memory: true }, readLayer), signal, timeout: Math.max(1, work.expires - Date.now()),
         consume: (body) => consumeGuest(new Response(body, { headers: { "content-type": "application/x-ndjson" } }), onLog, onArtifact),
       });
     } finally {

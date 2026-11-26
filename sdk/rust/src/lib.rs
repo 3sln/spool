@@ -117,6 +117,19 @@ pub struct Artifact {
     pub url: String,
     pub size: usize,
     pub digest: String,
+    pub expires_at: Option<String>,
+    pub download_plan_url: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+pub struct DownloadPlan {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub method: String,
+    pub authenticated: bool,
+    pub url: String,
+    pub size: usize,
+    pub digest: String,
+    pub expires_at: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 pub struct Event {
@@ -239,7 +252,7 @@ impl Client {
         }
         let agent = if method == "PUT"
             || url.path().ends_with("/complete")
-            || (method == "GET" && url.path().contains("/artifacts/"))
+            || (method == "GET" && (!authenticated || url.path().contains("/artifacts/")))
         {
             &self.transfer_agent
         } else {
@@ -497,9 +510,49 @@ impl Client {
         Ok(bytes)
     }
 
+    pub fn download_plan(&self, artifact: &Artifact) -> Result<DownloadPlan> {
+        let Some(path) = artifact.download_plan_url.as_ref() else {
+            return Ok(DownloadPlan {
+                kind: "http-get".to_owned(),
+                method: "GET".to_owned(),
+                authenticated: true,
+                url: artifact.url.clone(),
+                size: artifact.size,
+                digest: artifact.digest.clone(),
+                expires_at: artifact.expires_at.clone(),
+            });
+        };
+        let plan: DownloadPlan = self.json("GET", path, None)?;
+        if plan.method != "GET"
+            || !matches!(
+                (plan.kind.as_str(), plan.authenticated),
+                ("http-get", true) | ("presigned-get", false)
+            )
+            || plan.size != artifact.size
+            || plan.digest != artifact.digest
+        {
+            return Err(Error::Invalid(
+                "Runner returned an invalid artifact download plan",
+            ));
+        }
+        Ok(plan)
+    }
+
     /// Stream the declared bytes into a writer and verify the recorded SHA-256.
     pub fn download_to(&self, artifact: &Artifact, mut writer: impl Write) -> Result<()> {
-        let mut response = self.request("GET", &artifact.url, &[][..], None, None, true)?;
+        let plan = self.download_plan(artifact)?;
+        let result = self.request("GET", &plan.url, &[][..], None, None, plan.authenticated);
+        let mut response = match result {
+            Err(
+                Error::Invalid("Runner returned an off-origin transfer URL")
+                | Error::Server {
+                    status: 403 | 404, ..
+                },
+            ) if plan.kind == "presigned-get" => {
+                self.request("GET", &artifact.url, &[][..], None, None, true)?
+            }
+            other => other?,
+        };
         let mut reader = response.body_mut().as_reader();
         let mut hash = Sha256::new();
         let mut buffer = [0; 64 * 1024];

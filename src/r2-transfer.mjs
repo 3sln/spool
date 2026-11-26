@@ -22,16 +22,21 @@ export function directTransfers({ endpoint, bucket, accessKeyId, secretAccessKey
   async function signed(key, size, expires, query = {}) {
     const url = new URL([bucket, ...key.split("/")].map(encodeURIComponent).join("/"), base);
     for (const [name, value] of Object.entries(query)) url.searchParams.set(name, value);
-    url.searchParams.set("X-Amz-Expires", String(Math.max(1, Math.floor((expires - Date.now()) / 1000))));
-    // Sign the exact expected byte count along with the URL. A normal bytes/Blob body sets it.
+    // Uploads sign the expected content length. GETs carry no request body.
     const signer = client ?? new AwsClient({ ...await credentials(), region, service: "s3" });
+    const remaining = Math.floor((expires - Date.now()) / 1000);
+    if (size === undefined && remaining < 1) return undefined;
+    url.searchParams.set("X-Amz-Expires", String(Math.max(1, remaining)));
     const request = await signer.sign(url, {
-      method: "PUT", headers: { "content-length": String(size) }, aws: { signQuery: true, allHeaders: true },
+      method: size === undefined ? "GET" : "PUT",
+      headers: size === undefined ? undefined : { "content-length": String(size) },
+      aws: { signQuery: true, allHeaders: true },
     });
     return request.url;
   }
 
   return {
+    download: (key, expires) => signed(key, undefined, expires),
     kind(size) { return size > directSingleBytes ? "presigned-multipart" : "presigned-put"; },
     async create({ storage, size }) {
       if (this.kind(size) !== "presigned-multipart") return {};

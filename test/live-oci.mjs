@@ -18,6 +18,8 @@ const nonce = crypto.randomUUID();
 const lower = buildLayer([
   file("value.txt", "old\n"), file("obsolete.txt", nonce), file("opaque/old.txt", "hide me"),
   file("unaffected.txt", "preserved\n"),
+  { ...file("probe.sh", "#!/bin/sh\ntest -s value.txt\n"), executable: true },
+  { kind: "symlink", path: "probe", target: "probe.sh" },
 ]);
 const upper = gzipSync(buildLayer([
   file("value.txt", `new ${nonce}\n`), { kind: "delete", path: "obsolete.txt" },
@@ -44,6 +46,7 @@ test ! -e opaque/old.txt
 ${local ? "if grep -q '[[:space:]]00000000[[:space:]]' /proc/net/route; then exit 1; fi; grep -q 'lo:' /proc/net/dev" : ":"}
 test ! -e /tmp/spool-probe-reuse-marker
 touch /tmp/spool-probe-reuse-marker
+./probe
 cat value.txt unaffected.txt opaque/new.txt > result.txt
 cat result.txt
 sleep 2

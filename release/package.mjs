@@ -15,7 +15,8 @@ const packageInfo = {
   repository: { type: "git", url: "git+https://github.com/3sln/spool.git" },
 };
 const clientFiles = [
-  "client/index.mjs", "client/build-cache.mjs", "client/cache-leases.mjs", "client/layers.mjs", "client/node.mjs", "client/taskfile.mjs", "client/generated/js",
+  "client/index.mjs", "client/build-cache.mjs", "client/cache-leases.mjs", "client/container-build.mjs",
+  "client/layers.mjs", "client/node.mjs", "client/taskfile.mjs", "client/generated/js",
 ];
 const packages = [
   {

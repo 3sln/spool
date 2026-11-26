@@ -153,6 +153,15 @@ test("lazy layers, idempotency, tenant isolation, replay, artifacts and cache ev
   const artifact = await request(handler, artifacts[0].url);
   assert.equal(await artifact.text(), "hello from Spool");
   assert.equal(await sha256("hello from Spool"), artifacts[0].digest);
+  assert.ok(Date.parse(artifacts[0].expires_at) > Date.now());
+  const plan = await (await request(handler, artifacts[0].download_plan_url)).json();
+  assert.equal(plan.type, "http-get");
+  assert.equal(plan.url, artifacts[0].url);
+  assert.equal((await request(handler, artifacts[0].download_plan_url, { user: "bob" })).status, 404);
+  await data.store.commit({ [`history/${initial.task_id}`]: Date.now() - 1 });
+  assert.equal((await request(handler, initial.links.artifacts)).status, 404);
+  assert.equal((await request(handler, artifacts[0].url)).status, 404);
+  assert.equal((await request(handler, artifacts[0].download_plan_url)).status, 404);
 
   const warm = await submit(handler, { ...spec, client_request_id: "cached" });
   assert.equal(warm.state, "QUEUED");
@@ -172,9 +181,11 @@ test("rejects invalid archives and finalizes a timed-out command", async (t) => 
   const badJob = await submit(handler, manifest("invalid", [invalid.descriptor]));
   await upload(handler, badJob, invalid);
   await service.run(badJob.task_id, runGuest);
-  assert.equal((await service.status(await tenantFor(auth, new Request("https://spool.test", {
-    headers: { "x-fixture-user": "alice" },
-  })), badJob.task_id)).result.error, "LAYER_INVALID");
+  const { result } = await (await request(handler, badJob.links.self)).json();
+  assert.equal(result.error, "LAYER_INVALID");
+  assert.equal(result.layer_error.index, 0);
+  assert.equal(result.layer_error.digest, invalid.descriptor.digest);
+  assert.match(result.layer_error.reason, /entry.*invalid\.txt.*invalid archive path/);
   const slow = manifest("slow");
   slow.command.argv = ["sleep", "5"];
   slow.resources.timeout_s = 1;

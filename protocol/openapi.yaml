@@ -191,6 +191,19 @@ paths:
           description: Authorized artifact bytes.
           content: { application/octet-stream: { schema: { type: string, format: binary } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/artifacts/{index}/download:
+    parameters:
+      - { $ref: '#/components/parameters/TaskId' }
+      - { name: index, in: path, required: true, schema: { type: integer, minimum: 0, maximum: 7 } }
+    get:
+      operationId: planArtifactDownload
+      responses:
+        '200':
+          description: Short-lived direct or authenticated gateway download plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DownloadPlan' }
+        default: { $ref: '#/components/responses/Error' }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer }
@@ -223,6 +236,7 @@ components:
         task_id: { type: string, pattern: '^[0-9a-f-]{36}$' }
         state: { enum: [WAITING_FOR_LAYER, QUEUED, RUNNING, SUCCEEDED, FAILED, EXPIRED, CANCELLED] }
         created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
         deadline: { type: string, format: date-time }
         task_deadline: { type: string, format: date-time }
         hard_deadline: { type: string, format: date-time }
@@ -230,13 +244,14 @@ components:
         cursor: { type: integer, minimum: 0 }
         resource_profile:
           type: object
-          description: Selected runner profile and effective task resources when resource selection applies.
+          description: Selected runner profile. Disk is the task's workspace budget. Capacity describes the provider tier.
           required: [name, cpu, memory_mib, disk_mib]
           properties:
             name: { type: string }
             cpu: { type: integer, minimum: 1 }
             memory_mib: { type: integer, minimum: 1 }
             disk_mib: { type: integer, minimum: 1 }
+            capacity: { type: object }
         required:
           type: array
           items: { $ref: './manifest.schema.json#/properties/environment/properties/layers/items' }
@@ -250,6 +265,19 @@ components:
             error: { type: string }
             retryable: { type: boolean }
             output_truncated: { type: boolean }
+            usage:
+              type: object
+              required: [cpu_ms, wall_ms]
+              properties:
+                cpu_ms: { type: integer, minimum: 0 }
+                wall_ms: { type: integer, minimum: 0 }
+            layer_error:
+              type: object
+              required: [reason]
+              properties:
+                index: { type: integer, minimum: 0 }
+                digest: { $ref: './manifest.schema.json#/$defs/digest' }
+                reason: { type: string }
         links: { type: object, additionalProperties: { type: string, format: uri-reference } }
     UploadPlan:
       type: object
@@ -301,3 +329,16 @@ components:
         size: { type: integer, minimum: 0 }
         media_type: { const: application/octet-stream }
         url: { type: string, format: uri-reference }
+        expires_at: { type: string, format: date-time }
+        download_plan_url: { type: string, format: uri-reference }
+    DownloadPlan:
+      type: object
+      required: [type, method, authenticated, url, size, digest, expires_at]
+      properties:
+        type: { enum: [http-get, presigned-get] }
+        method: { const: GET }
+        authenticated: { type: boolean }
+        url: { type: string, format: uri-reference }
+        size: { type: integer, minimum: 0 }
+        digest: { $ref: './manifest.schema.json#/$defs/digest' }
+        expires_at: { type: string, format: date-time }

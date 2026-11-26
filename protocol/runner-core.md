@@ -59,6 +59,10 @@ With no artifact provider, executors can return small inline artifacts using
 `{ path, body }`, where `body` is base64. Inline output is capped at 512 KiB
 across the task and by the configured artifact budget.
 
+With an artifact provider and a layer provider that implements `putVerified`, the core can seed the layer cache from a previous task's archive artifact in the same tenant.
+
+An artifact provider can implement `presignDownload(key, expiresAtMs)` to issue a short-lived HTTPS GET URL for the verified object. Return `undefined` when the artifact needs an authenticated gateway download.
+
 Gateway PUT is the default. A transfer provider defaults to advertising
 `presigned-put` and `presigned-multipart`. Set `limits.uploads` for a subset or
 to offer gateway PUT alongside them.

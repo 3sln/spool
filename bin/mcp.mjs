@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
-import { realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { createWriteStream } from "node:fs";
+import { link, realpath, rm } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import manifestSchema from "../protocol/manifest.schema.json" with { type: "json" };
 import { createClient } from "../client/index.mjs";
-import { openLayerCache } from "../client/node.mjs";
+import { directorySelection, openLayerCache } from "../client/node.mjs";
 import { prepareTaskFile } from "../client/taskfile.mjs";
 import pkg from "../package.json" with { type: "json" };
 import { cliState, initializeCli, parseCli } from "./mcp-config.mjs";
@@ -22,7 +25,7 @@ async function serve(options, env) {
   lifecycle.signal.addEventListener("abort", closeInput, { once: true });
   let cache;
   try {
-    const workspacePathOption = options.workspace ?? env.SPOOL_WORKSPACE_ROOT;
+    const workspacePathOption = options.workspace ?? env.SPOOL_WORKSPACE_ROOT ?? env.CLAUDE_PROJECT_DIR;
     const workspace = workspacePathOption && await realpath(workspacePathOption);
     const leaseTtlMs = env.SPOOL_CACHE_LEASE_SECONDS === undefined ? undefined : Number(env.SPOOL_CACHE_LEASE_SECONDS) * 1000;
     cache = await openLayerCache(state.blobs, { workspace: workspace || undefined, leaseTtlMs });
@@ -43,9 +46,16 @@ async function serve(options, env) {
     }
 
     const id = { type: "string" };
-    const deadline = { type: "integer", minimum: 1, maximum: 3600 };
+    const maxWaitSeconds = 100;
     const fields = (properties, required = Object.keys(properties)) => ({ type: "object", properties, required, additionalProperties: false });
     const idArgs = fields({ task_id: id });
+    const globs = { type: "array", items: id, description: "Paths or glob patterns relative to the layer directory" };
+    async function findArtifact(taskId, path, signal) {
+      const { artifacts } = await client.artifacts(taskId, { signal });
+      const artifact = artifacts.find((item) => item.path === path);
+      if (!artifact) throw new Error("Task has no artifact at this path");
+      return artifact;
+    }
     const tools = {
       capabilities: ["Check the runner's platforms, bases, limits, and resource profile before writing or submitting a Taskfile",
         fields({}), () => client.capabilities()],
@@ -56,30 +66,47 @@ async function serve(options, env) {
       renew_cache_lease: ["Renew the workspace's unexpired layer leases", fields({}), async () => ({ renewed: await cache.renew() })],
       release_cache_lease: ["Return the workspace's layer leases", fields({}), async () => ({ released: await cache.release() })],
       build_layer: ["Build and cache a workspace snapshot or directory delta", fields(
-        { directory: id, previous: id }, ["directory"],
-      ), async ({ directory, previous }, signal) => cache.buildDirectory(
-        await workspacePath(directory), { previous: previous === undefined ? undefined : await workspacePath(previous), signal },
+        { directory: id, previous: id, include: globs, exclude: globs }, ["directory"],
+      ), async ({ directory, previous, include, exclude }, signal) => cache.buildDirectory(
+        await workspacePath(directory), { previous: previous === undefined ? undefined : await workspacePath(previous),
+          ...directorySelection({ include, exclude }), signal },
       )],
       submit_template: ["Build and submit a JSON Taskfile. See taskfile_help for syntax. Call wait_task with the returned task ID to upload missing layers.",
         fields({ path: { type: "string", description: "Taskfile path relative to the configured project workspace" },
-          client_request_id: { type: "string", description: "Reuse this ID to retry the same manifest" } }, ["path"],
-      ), async ({ path, client_request_id }, signal) => {
+          client_request_id: { type: "string", description: "Reuse this ID to retry the same manifest" },
+          shards: { type: "integer", minimum: 2, maximum: 64, description: "Run independent copies with SPOOL_SHARD_INDEX and SPOOL_SHARD_COUNT" },
+        }, ["path"],
+      ), async ({ path, client_request_id, shards }, signal) => {
+        if (shards !== undefined && (!Number.isInteger(shards) || shards < 2 || shards > 64)) throw new TypeError("Invalid shard count");
         const file = await workspacePath(path);
-        const { manifest } = await prepareTaskFile(file, { contextRoot: workspace, client, cache, requestId: client_request_id, signal });
-        return client.submit(manifest, { signal });
+        const runner = shards === undefined ? undefined : await client.capabilities({ signal });
+        if (runner && !runner.features?.includes("task-shards")) throw new Error("Runner does not offer task shards");
+        const { manifest } = await prepareTaskFile(file, { contextRoot: workspace, client, runner, cache, requestId: client_request_id, signal });
+        if (shards === undefined) return client.submit(manifest, { signal });
+        const tasks = [];
+        for (let index = 0; index < shards; index++) {
+          const request = createHash("sha256").update(JSON.stringify([manifest.client_request_id, index, shards])).digest("hex");
+          try {
+            tasks.push({ index, task: await client.submit({ ...manifest, client_request_id: request, shard: { index, count: shards } }, { signal }) });
+          } catch (error) {
+            return { client_request_id: manifest.client_request_id, tasks, failed: { index, message: error.message } };
+          }
+        }
+        return { client_request_id: manifest.client_request_id, tasks };
       }],
       submit_task: ["Submit a manifest. Use build_layer to obtain layer descriptors.", manifestSchema,
         (args, signal) => client.submit(args, { signal })],
       task_status: ["Get task status and requested layers", idArgs, ({ task_id }, signal) => client.status(task_id, { signal })],
       wait_task: ["Upload requested layers from the local cache and wait up to wait_s seconds (default 20). Call again if the returned state is nonterminal.", fields(
-        { task_id: id, wait_s: { ...deadline, description: "Seconds to wait. Use at most 120 seconds per MCP request." } }, ["task_id"],
+        { task_id: id, wait_s: { type: "integer", minimum: 1, maximum: maxWaitSeconds, description: "Seconds to wait before returning current status." } }, ["task_id"],
       ), async ({ task_id, wait_s = 20 }, signal) => {
-        if (!Number.isInteger(wait_s) || wait_s < deadline.minimum || wait_s > deadline.maximum) throw new TypeError("Invalid wait_s");
-        const timeout = AbortSignal.timeout(wait_s * 1000);
+        if (!Number.isSafeInteger(wait_s) || wait_s < 1) throw new TypeError("Invalid wait_s");
+        const timeout = AbortSignal.timeout(Math.min(wait_s, maxWaitSeconds) * 1000);
         try { return await client.wait(task_id, { signal: AbortSignal.any([signal, timeout]) }); }
         catch (error) {
-          if (!timeout.aborted || signal.aborted) throw error;
-          return client.status(task_id, { signal });
+          if (signal.aborted || (!(error instanceof TypeError) && !timeout.aborted)) throw error;
+          const retrySignal = AbortSignal.any([signal, AbortSignal.timeout(8000)]);
+          return client.status(task_id, { signal: retrySignal });
         }
       }],
       extend_task: ["Extend a running task using total seconds since submission", fields({
@@ -89,12 +116,14 @@ async function serve(options, env) {
         task_id: id, cursor: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 100 },
       }, ["task_id"]), ({ task_id, cursor, limit }, signal) => client.eventPage(task_id, { cursor, limit, signal })],
       cancel_task: ["Cancel a durable task explicitly", idArgs, ({ task_id }, signal) => client.cancel(task_id, { signal })],
-      task_artifacts: ["List a task's output artifacts", idArgs, ({ task_id }, signal) => client.artifacts(task_id, { signal })],
-      read_artifact: ["Read an artifact from a task as base64", fields({ task_id: id, path: id }),
-        async ({ task_id, path }, signal) => {
-          const { artifacts } = await client.artifacts(task_id, { signal });
-          const artifact = artifacts.find((item) => item.path === path);
-          if (!artifact) throw new Error("Task has no artifact at this path");
+      task_artifacts: ["List a task's output artifacts, expiry, and download plan endpoints", idArgs, ({ task_id }, signal) => client.artifacts(task_id, { signal })],
+      read_artifact: ["Read a small task artifact as base64 or UTF-8", fields({
+        task_id: id, path: id, encoding: { type: "string", enum: ["base64", "utf-8"] },
+      }, ["task_id", "path"]),
+        async ({ task_id, path, encoding = "base64" }, signal) => {
+          if (!["base64", "utf-8"].includes(encoding)) throw new TypeError("Invalid artifact encoding");
+          const artifact = await findArtifact(task_id, path, signal);
+          if (artifact.size > 512 * 1024) throw new Error("Artifact exceeds the MCP inline limit. Use download_artifact");
           const response = await client.download(artifact, { signal });
           const reader = response.body.getReader();
           let size = 0;
@@ -113,12 +142,46 @@ async function serve(options, env) {
           if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== artifact.digest) {
             throw new Error("Artifact digest does not match");
           }
-          return { ...artifact, encoding: "base64", data: bytes.toString("base64") };
+          return { ...artifact, encoding, data: encoding === "utf-8"
+            ? new TextDecoder("utf-8", { fatal: true }).decode(bytes) : bytes.toString("base64") };
         }],
+      download_artifact: ["Verify and save an artifact to a new file under the configured workspace", fields({
+        task_id: id, path: id, destination: id,
+      }), async ({ task_id, path, destination }, signal) => {
+        if (typeof destination !== "string" || isAbsolute(destination)
+          || destination.split(/[\\/]/u).some((part) => !part || part === "." || part === "..")) {
+          throw new TypeError("Use a relative path for a new workspace file");
+        }
+        const parent = await workspacePath(dirname(destination));
+        const target = join(parent, basename(destination));
+        const temporary = join(parent, `.spool-download-${crypto.randomUUID()}.tmp`);
+        const artifact = await findArtifact(task_id, path, signal);
+        const response = await client.download(artifact, { signal });
+        const hash = createHash("sha256");
+        let size = 0;
+        const verify = new Transform({
+          transform(chunk, _encoding, callback) {
+            size += chunk.length;
+            if (size > artifact.size) return callback(new Error("Artifact exceeds the advertised size"));
+            hash.update(chunk);
+            callback(null, chunk);
+          },
+        });
+        try {
+          await pipeline(Readable.fromWeb(response.body), verify, createWriteStream(temporary, { flags: "wx", mode: 0o600 }), { signal });
+          if (size !== artifact.size || `sha256:${hash.digest("hex")}` !== artifact.digest) throw new Error("Artifact size or digest does not match");
+          signal.throwIfAborted();
+          await link(temporary, target);
+          return { ...artifact, destination };
+        } finally {
+          await rm(temporary, { force: true });
+        }
+      }],
     };
     if (!workspace) {
       delete tools.build_layer;
       delete tools.submit_template;
+      delete tools.download_artifact;
       delete tools.renew_cache_lease;
       delete tools.release_cache_lease;
     }
@@ -254,7 +317,16 @@ try {
       break;
     }
     case "version": console.log(pkg.version); break;
-    case "init": console.log(JSON.stringify(await initializeCli(options), null, 2)); break;
+    case "init": {
+      const result = await initializeCli(options);
+      console.log(JSON.stringify(result, null, 2));
+      if (!options["dry-run"] && ["claude", "project"].includes(options.client ?? "project") && options.scope !== "user") {
+        console.error("Claude Code asks you to approve project MCP servers in its interactive UI.");
+      }
+      break;
+    }
+    case "capabilities": console.log(JSON.stringify(await createClient(await runnerConnection(options, process.env))
+      .capabilities({ signal: AbortSignal.timeout(10000) }), null, 2)); break;
     case "auth": console.log(JSON.stringify(await authCommand(options, process.env), null, 2)); break;
     case "cache-gc": {
       const state = await cliState(options, process.env);

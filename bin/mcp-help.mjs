@@ -15,6 +15,7 @@ const help = {
 Commands
   serve       Start the stdio MCP server. This is the default.
   init        Add Spool to a project's MCP configuration.
+  capabilities  Query a runner's profiles and limits without MCP setup.
   auth        Sign in, list local credentials, or remove a profile.
   cache-gc    Reclaim layers with no live workspace lease.
   taskfile    Read the Taskfile guide, schemas, and runnable example.
@@ -41,7 +42,9 @@ Environment
   SPOOL_BLOB_DIR              Override the layer directory for shared or custom state.
   SPOOL_AUTH_DIR              Override the location of saved credentials.
   SPOOL_CACHE_LEASE_SECONDS   Override the default seven-day workspace lease.
-  SPOOL_TRANSFER_ORIGINS      Comma-separated HTTPS origins for direct uploads.
+  SPOOL_TRANSFER_ORIGINS      Comma-separated HTTPS origins for direct transfers.
+  SPOOL_BUILD_ENGINES         Ordered local build engines. Defaults to docker,podman.
+  SPOOL_BUILD_TMPDIR          Scratch directory shared with the build engine.
 
 Call taskfile_help or browse the Taskfile MCP resources for examples and schemas.`,
   init: `Usage: spool-mcp init [options]
@@ -53,6 +56,7 @@ Options
                                   project and claude use .mcp.json.
                                   cursor uses .cursor/mcp.json.
   --config PATH                   Override the default config path.
+  --scope user                    With --client claude, use ~/.claude.json.
   --name NAME                     Server name in the config. Defaults to spool.
   --dry-run                       Print the proposed entry without writing.
   --force                         Replace a conflicting entry of the same name.
@@ -60,8 +64,15 @@ ${runnerOptions}
 
 Example
   spool-mcp init --profile NAME --workspace .
+  spool-mcp init --client claude --scope user --profile NAME
 
-Reload the MCP host after saving the config. Use spool-mcp auth login to create a profile.`,
+Reload the MCP host after saving the config. Claude Code asks you to approve
+project-scoped servers. Add .spool-leases/ to your project's ignore file.
+Generated entries can contain machine-specific paths and profile names.`,
+  capabilities: `Usage: spool-mcp capabilities [--profile NAME] [--runner URL]
+
+Print the live runner's bases, upload limits, and resource profiles as JSON.
+Select a saved profile with --profile or SPOOL_PROFILE, or supply a runner URL.`,
   auth: `Usage: spool-mcp auth <login|list|logout> [options]
 
 Profiles bind credentials to one runner origin. Select a profile with --profile

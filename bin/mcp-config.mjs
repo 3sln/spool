@@ -11,7 +11,7 @@ const defaults = {
 };
 const modes = new Set(["shared", "isolated", "custom"]);
 const serveFlags = ["runner", "profile", "workspace", "state-mode", "state-dir"];
-const initFlags = [...serveFlags, "client", "config", "name", "force", "dry-run"];
+const initFlags = [...serveFlags, "client", "scope", "config", "name", "force", "dry-run"];
 
 export function validRunner(value) {
   if (!value) return undefined;
@@ -37,13 +37,14 @@ export function parseCli(args) {
   if (args[0] === "--version") return { command: "version" };
   if (args[0] === "help") return showHelp(isHelp(args[1]) ? "" : args.slice(1).join(" "));
   let topic = "";
-  if (["init", "serve", "cache-gc", "auth", "taskfile"].includes(args[0])) {
+  if (["init", "serve", "capabilities", "cache-gc", "auth", "taskfile"].includes(args[0])) {
     result.command = args.shift();
     topic = result.command;
   }
   if (isHelp(args[0])) return showHelp(topic);
   let allowed = serveFlags;
   if (result.command === "init") allowed = initFlags;
+  if (result.command === "capabilities") allowed = ["runner", "profile"];
   if (result.command === "cache-gc") allowed = ["state-dir"];
   if (result.command === "auth") {
     if (!args.length) return showHelp(topic);
@@ -131,8 +132,12 @@ function updatedConfig(config, name, entry, force) {
 export async function initializeCli(options) {
   const client = options.client ?? "project";
   if (!Object.hasOwn(defaults, client)) throw new TypeError("Client must be project, claude, or cursor");
+  const scope = options.scope ?? "project";
+  if (!["project", "user"].includes(scope) || (scope === "user" && client !== "claude")) {
+    throw new TypeError("Use --client claude with --scope user");
+  }
   normalizeState(options["state-mode"], options["state-dir"]);
-  const path = resolve(options.config ?? defaults[client]);
+  const path = resolve(options.config ?? (scope === "user" ? join(homedir(), ".claude.json") : defaults[client]));
   const name = options.name ?? "spool";
   if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/u.test(name)) throw new TypeError("Invalid MCP server name");
   const entry = configEntry({
