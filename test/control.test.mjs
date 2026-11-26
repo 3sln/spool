@@ -313,7 +313,8 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   await writeFile(join(fixture, "value.txt"), "reusable layer");
   const write = (path, contents) => writeFile(join(root, path), JSON.stringify({ version: "0.1", ...contents }));
   await write("base.json", {
-    kind: "base", task_timeout_s: 60, requires: { platform: "linux/amd64", base: BASE.id, features: ["lazy-layers"] },
+    kind: "base", task_timeout_s: 60,
+    requires: { platform: "linux/amd64", base: BASE.id, features: ["lazy-layers"], resources: { memory_mib: 256 } },
     layers: [{ id: "source", kind: "directory", path: "source" }],
     command: { cwd: "/workspace" },
   });
@@ -322,7 +323,7 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   await write("task.json", {
     kind: "task", extends: ["base.json", "child.json"],
     command: { argv: ["sh", "-ec", `${readValue}; ${writeResult}`] },
-    requires: { limits: { max_layers: 1 } },
+    requires: { limits: { max_layers: 1 }, resources: { cpu: 1, memory_mib: 128 } },
     outputs: { paths: ["/workspace/result.txt"] },
   });
   const cache = await openLayerCache(join(root, "cache"));
@@ -346,6 +347,8 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   });
   const mismatched = { ...await client.capabilities(), features: [] };
   await assert.rejects(prepareTaskFile(taskfile, { runner: mismatched, cache }), /missing the required feature/);
+  const undersized = { ...await client.capabilities(), resource_profiles: [{ cpu: 1, memory_mib: 128, disk_mib: 4096 }] };
+  await assert.rejects(prepareTaskFile(taskfile, { runner: undersized, cache }), /satisfies requires.resources/);
   assert.deepEqual(await cache.list(), []);
   let active;
   const interval = setInterval(() => { if (active) void service.run(active.task_id, runGuest); }, 20);
@@ -357,6 +360,8 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   assert.equal(first.layers.length, 1);
   assert.equal(first.layers[0].id, "source");
   assert.equal(first.manifest.resources.timeout_s, 3);
+  assert.deepEqual(first.manifest.min_resources, { cpu: 1, memory_mib: 256 });
+  assert.equal(first.task.resource_profile.name, "fixed");
   assert.equal(uploads, 1);
   const second = await runTaskFile(taskfile, { client, cache, requestId: "template-second", signal, onAccepted: (task) => { active = task; } });
   assert.equal(second.task.state, "SUCCEEDED");

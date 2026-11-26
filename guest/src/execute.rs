@@ -30,7 +30,7 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn restrict(timeout: u64, disk_mib: u32) -> io::Result<()> {
+fn restrict(cpu_seconds: u64, disk_mib: u32, _memory_mib: u32) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
         return Err(io::Error::last_os_error());
@@ -53,14 +53,15 @@ fn restrict(timeout: u64, disk_mib: u32) -> io::Result<()> {
         }
         Ok(())
     }
-    set(libc::RLIMIT_CPU, timeout, timeout + 1)?;
+    set(libc::RLIMIT_CPU, cpu_seconds, cpu_seconds + 1)?;
     let file_limit = u64::from(disk_mib) * 1024 * 1024;
     set(libc::RLIMIT_FSIZE, file_limit, file_limit)?;
     set(libc::RLIMIT_NOFILE, 256, 256)?;
     set(libc::RLIMIT_CORE, 0, 0)?;
     #[cfg(target_os = "linux")]
     {
-        set(libc::RLIMIT_AS, 256 * 1024 * 1024, 256 * 1024 * 1024)?;
+        let address_space = u64::from(_memory_mib) * 1024 * 1024;
+        set(libc::RLIMIT_AS, address_space, address_space)?;
         set(libc::RLIMIT_NPROC, 64, 64)?;
     }
     Ok(())
@@ -113,8 +114,14 @@ fn execute_command(
     let command = &manifest.command;
     let timeout = manifest.resources.timeout_s;
     let disk_mib = manifest.resources.disk_mib;
-    if timeout == 0 || timeout > 2_147_483 {
-        return Err(io::Error::other("invalid command timeout"));
+    let cpu = manifest.resources.cpu;
+    let memory_mib = manifest.resources.memory_mib;
+    if timeout == 0
+        || timeout > 2_147_483
+        || !(1..=4).contains(&cpu)
+        || !(256..=12_288).contains(&memory_mib)
+    {
+        return Err(io::Error::other("invalid command resources"));
     }
     let path = workspace::workspace_parts(&command.cwd)?
         .iter()
@@ -141,7 +148,7 @@ fn execute_command(
         child_command.uid(UID).gid(UID);
     }
     unsafe {
-        child_command.pre_exec(move || restrict(timeout, disk_mib));
+        child_command.pre_exec(move || restrict(timeout * u64::from(cpu), disk_mib, memory_mib));
     }
     let mut child = child_command.spawn()?;
     let pid = child.id() as libc::pid_t;

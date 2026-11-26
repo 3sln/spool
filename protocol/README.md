@@ -8,6 +8,10 @@ The authenticated principal and `client_request_id` identify one submission for 
 
 The discovery document reports the auth profile. OAuth runners expose [protected-resource metadata](https://www.rfc-editor.org/rfc/rfc9728.html) at `/.well-known/oauth-protected-resource`. Clients can verify credentials with `GET /v1/auth/check`, which returns HTTP 204 after authentication without creating a task.
 
+## Resource requirements
+
+The manifest's `resources` object carries the runner's baseline profile and optional command timeout. Add `min_resources` with any of `cpu` (whole vCPUs), `memory_mib`, or `disk_mib` to request higher minima. The runner advertises these options in `resource_profiles` on its discovery document. Values in that list describe the supported budgets of each tier. A submission needing an unavailable tier receives HTTP 422 with `RESOURCE_LIMIT` before upload plans are issued. An accepted task can include its selected tier and effective budgets in `resource_profile`. Provider capacity is checked when launching the selected tier. Placement failures stay subject to the startup deadline.
+
 ## Deadlines and states
 
 Every submission supplies a positive `task_timeout_s`. It starts at acceptance and covers layer uploads, queueing, startup, and execution. The runner advertises `limits.max_task_seconds`, which fixes `hard_deadline` at acceptance. The status field `task_deadline` is the requested whole-task deadline. `deadline` is the effective deadline in the current state. While waiting for layers or queueing, it is also bounded by the admission window. An optional `resources.timeout_s` separately limits command runtime. `execution_deadline_limit` gives the latest effective deadline the runner can grant after claiming the task.

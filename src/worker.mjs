@@ -1,24 +1,29 @@
 import { DurableObject } from "cloudflare:workers";
-import { publicEndpoint, taskEndpoint } from "./api.mjs";
+import { taskEndpoint } from "./api.mjs";
+import { createRunnerHandler } from "./core.mjs";
 import { configuredAuth } from "./auth.mjs";
 import { configuredLimits, readJSON } from "./contract.mjs";
 import { TaskService } from "./service.mjs";
 import { workStream } from "./work-stream.mjs";
 import { r2Transfers } from "./r2-transfer.mjs";
 import { waitForGuest } from "./cloud-startup.mjs";
+import { workerResourcePolicy } from "./worker-resources.mjs";
 
 const EXECUTION = {
-  network: "container-internet-disabled", cpu: "vm-one-vcpu-plus-process-rlimit",
-  memory: "per-process-address-space", disk: "per-file-rlimit-and-vm-disk",
+  network: "container-internet-disabled", cpu: "vm-vcpu-plus-process-rlimit",
+  memory: "vm-memory-and-per-process-address-space", disk: "per-file-rlimit-and-vm-disk",
 };
 const internal = "https://spool.internal";
 const guestOrigin = "http://spool.internal";
 const tenantHeader = "x-spool-internal-tenant";
 const guestPollMs = 5000;
 const guestIdleMs = 120_000;
-const workerLimits = (env, direct) => configuredLimits(env, direct
-  ? { uploads: ["presigned-put", "presigned-multipart"] }
-  : { layerCeiling: 32, defaultLayer: 32 });
+function workerLimits(env, direct) {
+  const limits = configuredLimits(env, direct
+    ? { uploads: ["presigned-put", "presigned-multipart"] }
+    : { layerCeiling: 32, defaultLayer: 32 });
+  return { ...limits, ...workerResourcePolicy(env) };
+}
 
 export function createWorkerRunner({ auth = configuredAuth } = {}) {
   const endpoints = new WeakMap();
@@ -27,13 +32,17 @@ export function createWorkerRunner({ auth = configuredAuth } = {}) {
       let endpoint = endpoints.get(env);
       if (!endpoint) {
         const transfer = r2Transfers(env);
-        endpoint = publicEndpoint(auth(env), env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], EXECUTION, (next, tenant) => {
-          const headers = new Headers(next.headers);
-          headers.delete("authorization");
-          headers.delete("cf-access-jwt-assertion");
-          headers.set(tenantHeader, tenant);
-          return env.TENANTS.getByName(tenant).fetch(new Request(next, { headers }));
-        }, workerLimits(env, transfer));
+        endpoint = createRunnerHandler({
+          auth: auth(env), origins: env.SPOOL_ALLOWED_ORIGINS?.split(","),
+          execution: EXECUTION, limits: workerLimits(env, transfer),
+          dispatch(next, tenant) {
+            const headers = new Headers(next.headers);
+            headers.delete("authorization");
+            headers.delete("cf-access-jwt-assertion");
+            headers.set(tenantHeader, tenant);
+            return env.TENANTS.getByName(tenant).fetch(new Request(next, { headers }));
+          },
+        });
         endpoints.set(env, endpoint);
       }
       return endpoint(request);
@@ -132,8 +141,13 @@ export class TenantRunner extends DurableObject {
       const startupDeadline = Math.min(work.expires, Date.now() + this.service.limits.start_budget_seconds * 1000);
       const response = await this.slot(id, work.claim).fetch(`${internal}/start`, {
         method: "POST", body: workStream(work, (index) => this.service.executionLayer(id, work.claim, index)),
-        headers: { "x-spool-expires": String(work.expires), "x-spool-startup-deadline": String(startupDeadline) },
+        headers: { "x-spool-expires": String(work.expires), "x-spool-startup-deadline": String(startupDeadline),
+          ...(work.resource_profile && work.resource_profile !== "fixed" && { "x-spool-resource-profile": work.resource_profile }) },
       });
+      if (response.status === 422) {
+        await this.service.finish(id, work.claim, { error: "RESOURCE_LIMIT" });
+        return;
+      }
       if (!response.ok) throw new Error(`Guest start returned ${response.status}`);
     } catch (error) {
       // The request can fail after the guest starts. Recover through the next poll.
@@ -212,6 +226,11 @@ export class GuestSlot extends DurableObject {
     const startupDeadline = Number(request.headers.get("x-spool-startup-deadline"));
     if (!Number.isSafeInteger(expires) || !Number.isSafeInteger(startupDeadline)
       || startupDeadline > expires || startupDeadline <= Date.now()) return new Response(null, { status: 408 });
+    const policy = workerResourcePolicy(this.env);
+    const instance = request.headers.get("x-spool-resource-profile") ?? policy.default_resource_profile;
+    if (instance && !policy.resource_profiles?.some(({ name }) => name === instance)) {
+      return new Response(null, { status: 422 });
+    }
 
     // Reserve this single-use slot before attempting to start the container.
     const started = await this.ctx.blockConcurrencyWhile(async () => {
@@ -221,17 +240,17 @@ export class GuestSlot extends DurableObject {
       return true;
     });
     if (!started) return new Response(null, { status: 409 });
-    return this.startGuest(container, startupDeadline, request.body);
+    return this.startGuest(container, startupDeadline, request.body, instance);
   }
 
-  async startGuest(container, deadline, body) {
+  async startGuest(container, deadline, body, instance) {
     const cancelled = () => this.ctx.storage.get("cancelled");
     const alias = this.env.SPOOL_CONTAINER_IMAGE;
     const startOptions = {};
     if (alias) {
       startOptions.image = container.images?.[alias];
       if (!startOptions.image) throw new Error(`Unknown guest container image ${alias}`);
-      startOptions.instance = this.env.SPOOL_CONTAINER_INSTANCE || "standard-2";
+      startOptions.instance = instance;
     }
     let port;
     try { port = await waitForGuest(container, deadline, cancelled, { startOptions }); }

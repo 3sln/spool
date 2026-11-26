@@ -1,0 +1,5 @@
+{
+  "base.json": "{\n  \"version\": \"0.1\",\n  \"kind\": \"base\",\n  \"task_timeout_s\": 180,\n  \"layers\": [{ \"id\": \"input\", \"kind\": \"directory\", \"path\": \"input\" }]\n}\n",
+  "Taskfile.json": "{\n  \"version\": \"0.1\",\n  \"kind\": \"task\",\n  \"extends\": [\"base.json\"],\n  \"command\": { \"argv\": [\"sh\", \"-ec\", \"cat message.txt; cp message.txt result.txt\"], \"cwd\": \"/workspace\" },\n  \"outputs\": { \"paths\": [\"/workspace/result.txt\"] }\n}\n",
+  "input/message.txt": "Hello from Spool.\n"
+}

@@ -1,4 +1,4 @@
-import { canonical, digestPattern, Fault, json, LIMITS, readBytes, sha256, terminal, validateManifest } from "./contract.mjs";
+import { canonical, digestPattern, Fault, INLINE_ARTIFACT_BYTES, json, LIMITS, planManifest, readBytes, sha256, terminal } from "./contract.mjs";
 
 const seconds = (value) => value * 1000;
 const taskKey = (id) => `task/${id}`;
@@ -32,6 +32,7 @@ function state(job) {
     ...(job.executionLimit ? { execution_deadline_limit: new Date(Math.min(job.hardDeadline ?? job.deadline, job.executionLimit)).toISOString() } : {}),
     cursor: job.events.length,
     required: job.missing, result: job.result,
+    ...(job.resourceProfile && { resource_profile: job.resourceProfile }),
     upload_plans: Object.fromEntries(job.missing.map((descriptor) => [descriptor.digest, uploadPlan(job, descriptor)])),
     links: { self: `/v1/tasks/${job.id}`, events: `/v1/tasks/${job.id}/events`, artifacts: `/v1/tasks/${job.id}/artifacts` },
   };
@@ -62,7 +63,7 @@ export class TaskService {
   async save(job) {
     const entries = { [taskKey(job.id)]: job };
     if (terminal.has(job.state)) {
-      entries[historyKey(job.id)] = Date.now() + seconds(LIMITS.history_ttl_seconds);
+      entries[historyKey(job.id)] = Date.now() + seconds(this.limits.history_ttl_seconds);
       await this.store.commit(entries, [activeKey(job.id)]);
     } else {
       entries[activeKey(job.id)] = job.tenant;
@@ -77,7 +78,7 @@ export class TaskService {
   }
 
   async submit(tenant, manifest) {
-    validateManifest(manifest, this.limits);
+    const resourceProfile = planManifest(manifest, this.limits);
     const fingerprint = await sha256(canonical(manifest));
     const raw = (await sha256(canonical([tenant, manifest.client_request_id]))).slice(7, 39);
     const id = `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`;
@@ -91,7 +92,7 @@ export class TaskService {
         await this.expire(existing);
         return state(existing);
       }
-      if ((await this.store.list("active/")).filter(([, owner]) => owner === tenant).length >= LIMITS.max_active_tasks_per_tenant) {
+      if ((await this.store.list("active/")).filter(([, owner]) => owner === tenant).length >= this.limits.max_active_tasks_per_tenant) {
         throw new Fault("QUOTA_EXCEEDED", "Too many active tasks", 429);
       }
       const accepted = Date.now();
@@ -99,7 +100,7 @@ export class TaskService {
       const hardDeadline = accepted + seconds(this.limits.max_task_seconds);
       const admissionLimit = accepted + seconds(this.limits.wait_seconds);
       const job = {
-        id, tenant, fingerprint, envDigest, manifest, events: [], state: "ACCEPTED",
+        id, tenant, fingerprint, envDigest, manifest, resourceProfile, events: [], state: "ACCEPTED",
         created_at: new Date(accepted).toISOString(), taskDeadline, hardDeadline, admissionLimit,
         deadline: Math.min(taskDeadline, admissionLimit), missing: [], artifacts: [],
         commandTimeout: manifest.resources.timeout_s ?? this.limits.max_job_seconds,
@@ -126,7 +127,14 @@ export class TaskService {
       job.state = "WAITING_FOR_LAYER";
       job.uploadToken ??= crypto.randomUUID();
       job.transferKinds ??= {};
-      if (this.transfers) for (const descriptor of job.missing) job.transferKinds[descriptor.digest] = this.transfers.kind(descriptor.size);
+      if (this.transfers) for (const descriptor of job.missing) {
+        const kind = this.transfers.kind(descriptor.size);
+        if (this.limits.uploads && !this.limits.uploads.includes(kind)) {
+          throw new Error("Transfer provider selected an unadvertised upload transport");
+        }
+        if (kind === "http-put") delete job.transferKinds[descriptor.digest];
+        else job.transferKinds[descriptor.digest] = kind;
+      }
       event(job, "layer.required", { digests: job.missing, deadline: new Date(job.deadline).toISOString(),
         upload_plans: Object.fromEntries(job.missing.map((descriptor) => [descriptor.digest, uploadPlan(job, descriptor)])) });
     } else {
@@ -271,7 +279,7 @@ export class TaskService {
       await this.locked(async () => {
         const previous = await this.store.get(leaseKey(key));
         if (!previous || previous.expires <= Date.now()) {
-          await this.store.commit({ [leaseKey(key)]: { size: descriptor.size, expires: Date.now() + seconds(LIMITS.cache_ttl_seconds) } });
+          await this.store.commit({ [leaseKey(key)]: { size: descriptor.size, expires: Date.now() + seconds(this.limits.cache_ttl_seconds) } });
         }
       });
     } else {
@@ -293,7 +301,7 @@ export class TaskService {
   }
 
   async recordLayer(job, { digest, size }, key, storage) {
-    await this.store.commit({ [leaseKey(key)]: { size, storage, expires: Date.now() + seconds(LIMITS.cache_ttl_seconds) } });
+    await this.store.commit({ [leaseKey(key)]: { size, storage, expires: Date.now() + seconds(this.limits.cache_ttl_seconds) } });
     job.uploaded ??= [];
     if (!job.uploaded.includes(digest)) job.uploaded.push(digest);
     event(job, "layer.available", { digest, size });
@@ -303,7 +311,7 @@ export class TaskService {
   }
 
   async retain(tenant, id, digest, ttl) {
-    if (!Number.isInteger(ttl) || ttl < 1 || ttl > LIMITS.cache_ttl_seconds) {
+    if (!Number.isInteger(ttl) || ttl < 1 || ttl > this.limits.cache_ttl_seconds) {
       throw new Fault("RESOURCE_LIMIT", "Invalid cache lease duration");
     }
     return this.locked(async () => {
@@ -346,13 +354,13 @@ export class TaskService {
   appendLog(job, channel, text) {
     if (!["stdout", "stderr"].includes(channel) || typeof text !== "string" || !text.length) return false;
     job.logOffsets ??= { stdout: 0, stderr: 0 };
-    const remaining = LIMITS.max_logs_bytes - job.logOffsets.stdout - job.logOffsets.stderr;
+    const remaining = this.limits.max_logs_bytes - job.logOffsets.stdout - job.logOffsets.stderr;
     const input = new TextEncoder().encode(text);
     job.logEvents ??= 0;
     let size = Math.min(input.length, remaining);
     while (size > 0 && size < input.length && (input[size] & 0xc0) === 0x80) size--;
     let offset = 0;
-    for (; offset < size && job.logEvents < LIMITS.max_log_events;) {
+    for (; offset < size && job.logEvents < this.limits.max_log_events;) {
       let end = Math.min(offset + 8192, size);
       while (end < size && (input[end] & 0xc0) === 0x80) end--;
       event(job, `task.${channel}`, {
@@ -575,8 +583,10 @@ export class TaskService {
       job.deadline = Math.min(job.taskDeadline, job.executionLimit);
       event(job, "task.started", { attempt: 1 });
       await this.save(job);
-      const manifest = { ...job.manifest, resources: { ...job.manifest.resources, timeout_s: commandTimeout } };
+    const { name, ...allocation } = job.resourceProfile ?? {};
+    const manifest = { ...job.manifest, resources: { ...job.manifest.resources, ...allocation, timeout_s: commandTimeout } };
       return { claim: job.claim, expires: Math.min(job.hardDeadline, job.executionLimit), manifest,
+        ...(name && { resource_profile: name }),
         ...(this.artifactStorage ? { artifact_limit: this.limits.max_artifact_bytes_total } : {}) };
     });
   }
@@ -620,7 +630,7 @@ export class TaskService {
           publishedBytes += artifact.size;
         }
       }
-      let remaining = Math.min(512 * 1024, this.limits.max_artifact_bytes_total - publishedBytes);
+      let remaining = Math.min(INLINE_ARTIFACT_BYTES, this.limits.max_artifact_bytes_total - publishedBytes);
       for (const raw of artifacts) {
         if (!paths.includes(raw?.path) || job.artifacts.some(({ path }) => path === raw.path)
           || typeof raw.body !== "string" || raw.body.length > Math.ceil(remaining / 3) * 4) continue;

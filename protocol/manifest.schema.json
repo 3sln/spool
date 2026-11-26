@@ -48,6 +48,7 @@
         "timeout_s": { "type": "integer", "minimum": 1, "maximum": 2147483 }
       }
     },
+    "min_resources": { "$ref": "#/$defs/resourceMinimums" },
     "network": {
       "type": "object", "additionalProperties": false, "required": ["mode"],
       "properties": { "mode": { "const": "none" } }
@@ -60,6 +61,15 @@
     }
   },
   "$defs": {
+    "resourceMinimums": {
+      "type": "object", "additionalProperties": false,
+      "description": "Minimum task resources selected from the runner's advertised profiles.",
+      "properties": {
+        "cpu": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "memory_mib": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "disk_mib": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
     "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
     "workspacePath": { "type": "string", "maxLength": 1024, "pattern": "^/workspace(?:/(?!\\.{1,2}(?:/|$))[^/\u0000]+)*$" }
   }

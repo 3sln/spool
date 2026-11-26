@@ -65,7 +65,7 @@ export async function taskEndpoint(request, tenant, service) {
     const url = new URL(request.url);
     const { method } = request;
     if (url.pathname === "/v1/tasks" && method === "POST") {
-      const task = await service.submit(tenant, await readJSON(request));
+      const task = await service.submit(tenant, await readJSON(request, service.limits?.max_manifest_bytes));
       return json(task, 202, { location: task.links.self });
     }
     const [prefix, api, tasks, taskId, sub, item, action, ...rest] = url.pathname.split("/");

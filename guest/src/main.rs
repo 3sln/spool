@@ -67,11 +67,23 @@ struct Resources {
     timeout_s: u64,
     #[serde(default = "default_workspace")]
     disk_mib: u32,
+    #[serde(default = "default_memory")]
+    memory_mib: u32,
+    #[serde(default = "default_cpu")]
+    cpu: u32,
 }
 
 #[derive(Default, Deserialize)]
 struct Outputs {
     paths: Vec<String>,
+}
+
+fn default_memory() -> u32 {
+    256
+}
+
+fn default_cpu() -> u32 {
+    1
 }
 
 fn read_work(input: impl Read) -> io::Result<Work> {

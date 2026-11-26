@@ -34,12 +34,14 @@ function run(command, args, options = {}) {
 try {
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", ...install]);
   run(process.execPath, ["--input-type=module", "-e",
-    'import { createClient } from "@3sln/spool-client"; import { openLayerCache } from "@3sln/spool-client/node"; import { prepareTaskFile } from "@3sln/spool-client/taskfile"; import { start } from "@3sln/spool-runner/node"; if (![createClient, openLayerCache, prepareTaskFile, start].every(x => typeof x === "function")) process.exitCode=1;',
+    'import { createClient } from "@3sln/spool-client"; import { openLayerCache } from "@3sln/spool-client/node"; import { prepareTaskFile } from "@3sln/spool-client/taskfile"; import { start } from "@3sln/spool-runner/node"; import { createRunnerCore, createRunnerHandler } from "@3sln/spool-runner/core"; if (![createClient, openLayerCache, prepareTaskFile, start, createRunnerCore, createRunnerHandler].every(x => typeof x === "function")) process.exitCode=1;',
   ]);
   const runner = join(scratch, "node_modules", "@3sln", "spool-runner");
   const mcp = join(scratch, "node_modules", "@3sln", "spool-mcp", "bin", "mcp.mjs");
   assert.equal(run(process.execPath, [join(runner, "bin", "runner.mjs"), "--version"]).trim(), version);
   assert.equal(run(process.execPath, [mcp, "--version"]).trim(), version);
+  assert.match(run(process.execPath, [mcp, "auth", "login", "--help"]), /--token-stdin/u);
+  assert.ok(JSON.parse(run(process.execPath, [mcp, "taskfile", "schema"]))["taskfile.schema.json"]);
   const globalPrefix = join(scratch, "global");
   const cli = entries.find((entry) => entry.package === "@3sln/spool-mcp");
   run("npm", ["install", "--global", "--prefix", globalPrefix, "--ignore-scripts", "--no-audit", "--no-fund", join(dist, cli.file)]);
@@ -64,6 +66,8 @@ try {
     `);
     run(esbuild, ["worker.mjs", "--bundle", "--platform=neutral", "--format=esm",
       "--external:cloudflare:*", "--outfile=worker.bundle.mjs"]);
+    await writeFile(join(scratch, "core.mjs"), 'export * from "@3sln/spool-runner/core";\n');
+    run(esbuild, ["core.mjs", "--bundle", "--platform=neutral", "--format=esm", "--outfile=core.bundle.mjs"]);
   }
   run(process.execPath, [mcp, "init", "--runner", "https://runner.example", "--state-mode", "isolated"]);
   const config = JSON.parse(await readFile(join(scratch, ".mcp.json"), "utf8"));

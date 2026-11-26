@@ -9,6 +9,8 @@ export const MEDIA = [
   "application/vnd.oci.image.layer.v1.tar+gzip",
 ];
 const MIB = 1024 ** 2;
+export const INLINE_ARTIFACT_BYTES = 512 * 1024;
+const resourceFields = ["cpu", "memory_mib", "disk_mib"];
 export const LIMITS = {
   max_layers: 16, max_layer_bytes: 512 * MIB, max_input_bytes: 2048 * MIB, workspace_mib: 4096,
   max_job_seconds: 604800, max_task_seconds: 604800, wait_seconds: 1800, start_budget_seconds: 600,
@@ -49,17 +51,27 @@ export function configuredLimits(env, { layerCeiling = 2048, defaultLayer = 512,
   };
 }
 
+function baseline(limits) {
+  return { cpu: 1, memory_mib: 256, disk_mib: limits.workspace_mib };
+}
+
+function resourceProfiles(limits) {
+  return limits.resource_profiles ?? [{ name: "fixed", ...baseline(limits) }];
+}
+
 export function capabilities(auth, execution, limits = LIMITS) {
+  const { resource_profiles, default_resource_profile, ...publishedLimits } = limits;
   return {
     protocol_versions: ["0.1"], platforms: ["linux/amd64"], bases: [BASE],
     layer_media_types: MEDIA, transports: ["http+sse"],
     features: ["lazy-layers", "cancel", "artifact-download", "cache-retention", "deadline-extension", "live-logs"],
     filesystem: "workspace-oci-tar-subset",
-    logs: { delivery: "live-sse-and-page", encoding: "utf-8", retention_s: LIMITS.history_ttl_seconds },
+    logs: { delivery: "live-sse-and-page", encoding: "utf-8", retention_s: limits.history_ttl_seconds ?? LIMITS.history_ttl_seconds },
     upload_transports: limits.uploads ?? ["http-put"],
-    resource_profile: { cpu: 1, memory_mib: 256, disk_mib: limits.workspace_mib },
+    resource_profile: baseline(limits),
+    resource_profiles: resourceProfiles(limits),
     resource_enforcement: execution,
-    auth, limits,
+    auth, limits: publishedLimits,
   };
 }
 
@@ -81,8 +93,14 @@ function workspace(path) {
 }
 
 export function validateManifest(value, limits = LIMITS) {
-  shape(value, ["protocol_version", "client_request_id", "task_timeout_s", "platform", "environment", "command", "resources", "network"], ["outputs"]);
-  const { protocol_version, client_request_id, task_timeout_s, platform, environment, command, resources, network, outputs } = value;
+  planManifest(value, limits);
+  return value;
+}
+
+export function planManifest(value, limits = LIMITS) {
+  shape(value, ["protocol_version", "client_request_id", "task_timeout_s", "platform", "environment", "command", "resources", "network"], ["outputs", "min_resources"]);
+  const { protocol_version, client_request_id, task_timeout_s, platform, environment, command, resources, network, outputs,
+    min_resources: minimum } = value;
   if (protocol_version !== "0.1" || !string(client_request_id, 128) || !/^[A-Za-z0-9._:-]+$/u.test(client_request_id)) {
     invalid("Unsupported protocol version or invalid client_request_id");
   }
@@ -97,7 +115,8 @@ export function validateManifest(value, limits = LIMITS) {
     throw new Fault("UNSUPPORTED_PLATFORM", "Select an advertised platform and base");
   }
 
-  if (!Array.isArray(environment.layers) || environment.layers.length > LIMITS.max_layers) invalid("Invalid layer count");
+  const maxLayers = Math.min(LIMITS.max_layers, limits.max_layers ?? LIMITS.max_layers);
+  if (!Array.isArray(environment.layers) || environment.layers.length > maxLayers) invalid("Invalid layer count");
   let total = 0;
   let uncompressed = 0;
   const sizes = new Map();
@@ -114,15 +133,13 @@ export function validateManifest(value, limits = LIMITS) {
     if (layer.media_type === MEDIA[0]) uncompressed += layer.size;
   }
   if (total > limits.max_input_bytes) throw new Fault("RESOURCE_LIMIT", "Combined layer size exceeds the limit", 413);
-  if (uncompressed > limits.workspace_mib * MIB * 3 / 4) {
-    throw new Fault("RESOURCE_LIMIT", "Uncompressed layers exceed the workspace input budget", 413);
-  }
   shape(command, ["argv", "cwd"]);
   if (!Array.isArray(command.argv) || !command.argv[0] || command.argv.length > 128
     || command.argv.some((argument) => !string(argument, 4096)) || !workspace(command.cwd)) invalid("Invalid command");
   shape(resources, ["cpu", "memory_mib", "disk_mib"], ["timeout_s"]);
   shape(network, ["mode"]);
-  if (resources.cpu !== 1 || resources.memory_mib !== 256 || resources.disk_mib !== limits.workspace_mib || network.mode !== "none"
+  const standard = baseline(limits);
+  if (resourceFields.some((field) => resources[field] !== standard[field]) || network.mode !== "none"
     || (resources.timeout_s !== undefined && (
       !Number.isSafeInteger(resources.timeout_s) || resources.timeout_s < 1 || resources.timeout_s > limits.max_job_seconds
     ))) {
@@ -130,12 +147,30 @@ export function validateManifest(value, limits = LIMITS) {
   }
   if (outputs !== undefined) {
     shape(outputs, ["paths"]);
-    if (!Array.isArray(outputs.paths) || outputs.paths.length > LIMITS.max_output_paths
+    const maxPaths = Math.min(LIMITS.max_output_paths, limits.max_output_paths ?? LIMITS.max_output_paths);
+    if (!Array.isArray(outputs.paths) || outputs.paths.length > maxPaths
       || new Set(outputs.paths).size !== outputs.paths.length || outputs.paths.some((path) => !workspace(path) || path === "/workspace")) {
       invalid("Invalid output paths");
     }
   }
-  return value;
+  const demand = { ...standard };
+  if (minimum !== undefined) {
+    shape(minimum, [], resourceFields);
+    for (const field of resourceFields) {
+      if (!Object.hasOwn(minimum, field)) continue;
+      if (!Number.isSafeInteger(minimum[field]) || minimum[field] < 1) invalid(`Invalid min_resources.${field}`);
+      demand[field] = Math.max(standard[field], minimum[field]);
+    }
+  }
+  const offers = resourceProfiles(limits);
+  const selected = !minimum || !Object.keys(minimum).length
+    ? offers.find(({ name }) => name === (limits.default_resource_profile ?? "fixed"))
+    : offers.find((offer) => resourceFields.every((field) => offer[field] >= demand[field]));
+  if (!selected) throw new Fault("RESOURCE_LIMIT", "No enabled runner profile satisfies the task's minimum resources", 422);
+  if (uncompressed > demand.disk_mib * MIB * 3 / 4) {
+    throw new Fault("RESOURCE_LIMIT", "Uncompressed layers exceed the workspace input budget", 413);
+  }
+  return (minimum !== undefined || limits.resource_profiles) ? { name: selected.name, ...demand, cpu: selected.cpu } : undefined;
 }
 
 // The manifest grammar admits only bounded integers, well-formed strings and plain JSON objects.

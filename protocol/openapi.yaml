@@ -228,6 +228,15 @@ components:
         hard_deadline: { type: string, format: date-time }
         execution_deadline_limit: { type: string, format: date-time }
         cursor: { type: integer, minimum: 0 }
+        resource_profile:
+          type: object
+          description: Selected runner profile and effective task resources when resource selection applies.
+          required: [name, cpu, memory_mib, disk_mib]
+          properties:
+            name: { type: string }
+            cpu: { type: integer, minimum: 1 }
+            memory_mib: { type: integer, minimum: 1 }
+            disk_mib: { type: integer, minimum: 1 }
         required:
           type: array
           items: { $ref: './manifest.schema.json#/properties/environment/properties/layers/items' }

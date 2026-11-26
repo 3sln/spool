@@ -7,8 +7,9 @@ import { createClient } from "../client/index.mjs";
 import { openLayerCache } from "../client/node.mjs";
 import { prepareTaskFile } from "../client/taskfile.mjs";
 import pkg from "../package.json" with { type: "json" };
-import { cliState, initializeCli, parseCli, usage } from "./mcp-config.mjs";
+import { cliState, initializeCli, parseCli } from "./mcp-config.mjs";
 import { authCommand, runnerConnection } from "./mcp-auth.mjs";
+import { taskfileHelp, taskfileResources, taskfileTopics } from "./taskfile-help.mjs";
 
 async function serve(options, env) {
   const state = await cliState(options, env);
@@ -46,7 +47,11 @@ async function serve(options, env) {
     const fields = (properties, required = Object.keys(properties)) => ({ type: "object", properties, required, additionalProperties: false });
     const idArgs = fields({ task_id: id });
     const tools = {
-      capabilities: ["Discover available platforms, bases and limits", fields({}), () => client.capabilities()],
+      capabilities: ["Check the runner's platforms, bases, limits, and resource profile before writing or submitting a Taskfile",
+        fields({}), () => client.capabilities()],
+      taskfile_help: ["Learn Taskfile syntax and semantics. Choose guide for the workflow, schema for both JSON schemas, or example for runnable project files.",
+        fields({ topic: { type: "string", enum: taskfileTopics, default: "guide" } }, []),
+        ({ topic = "guide" }) => taskfileHelp(topic)],
       gc_layer_cache: ["Remove layers without an active workspace lease", fields({}), (_args, signal) => cache.gc({ signal })],
       renew_cache_lease: ["Renew the workspace's unexpired layer leases", fields({}), async () => ({ renewed: await cache.renew() })],
       release_cache_lease: ["Return the workspace's layer leases", fields({}), async () => ({ released: await cache.release() })],
@@ -55,8 +60,9 @@ async function serve(options, env) {
       ), async ({ directory, previous }, signal) => cache.buildDirectory(
         await workspacePath(directory), { previous: previous === undefined ? undefined : await workspacePath(previous), signal },
       )],
-      submit_template: ["Build a checked-in JSON Taskfile and submit the resolved manifest", fields(
-        { path: id, client_request_id: id }, ["path"],
+      submit_template: ["Build and submit a JSON Taskfile. See taskfile_help for syntax. Call wait_task with the returned task ID to upload missing layers.",
+        fields({ path: { type: "string", description: "Taskfile path relative to the configured project workspace" },
+          client_request_id: { type: "string", description: "Reuse this ID to retry the same manifest" } }, ["path"],
       ), async ({ path, client_request_id }, signal) => {
         const file = await workspacePath(path);
         const { manifest } = await prepareTaskFile(file, { contextRoot: workspace, client, cache, requestId: client_request_id, signal });
@@ -65,8 +71,8 @@ async function serve(options, env) {
       submit_task: ["Submit a manifest. Use build_layer to obtain layer descriptors.", manifestSchema,
         (args, signal) => client.submit(args, { signal })],
       task_status: ["Get task status and requested layers", idArgs, ({ task_id }, signal) => client.status(task_id, { signal })],
-      wait_task: ["Supply requested layers from the client cache and wait for task completion", fields(
-        { task_id: id, wait_s: deadline }, ["task_id"],
+      wait_task: ["Upload requested layers from the local cache and wait up to wait_s seconds (default 20). Call again if the returned state is nonterminal.", fields(
+        { task_id: id, wait_s: { ...deadline, description: "Seconds to wait. Use at most 120 seconds per MCP request." } }, ["task_id"],
       ), async ({ task_id, wait_s = 20 }, signal) => {
         if (!Number.isInteger(wait_s) || wait_s < deadline.minimum || wait_s > deadline.maximum) throw new TypeError("Invalid wait_s");
         const timeout = AbortSignal.timeout(wait_s * 1000);
@@ -118,6 +124,10 @@ async function serve(options, env) {
     }
 
     const info = { name: "spool-mcp", version: pkg.version };
+    const advertised = { tools: {}, resources: {} };
+    const instructions = "Call taskfile_help for Taskfile syntax, schemas, or a runnable example. "
+      + (workspace ? "Then call capabilities, submit_template, and wait_task with the returned task ID."
+        : "Set --workspace or SPOOL_WORKSPACE_ROOT to enable Taskfile submission and layer building.");
     const modern = "2026-07-28";
     const legacy = ["2025-11-25", "2025-06-18", "2025-03-26"];
     const versionField = "io.modelcontextprotocol/protocolVersion";
@@ -133,10 +143,22 @@ async function serve(options, env) {
       }
       if (message.method === "initialize" && version === undefined) return result({
         protocolVersion: legacy.includes(message.params?.protocolVersion) ? message.params.protocolVersion : legacy[0],
-        serverInfo: info, capabilities: { tools: {} },
+        serverInfo: info, capabilities: advertised, instructions,
       });
-      if (message.method === "server/discover" && version === modern) return result({ supportedVersions: [modern, ...legacy], capabilities: { tools: {} } });
+      if (message.method === "server/discover" && version === modern) {
+        return result({ supportedVersions: [modern, ...legacy], capabilities: advertised, instructions });
+      }
       if (message.method === "ping" && version === undefined) return result({});
+      if (message.method === "resources/list") return result({
+        resources: taskfileResources.map(({ uri, name, description, mimeType }) => ({ uri, name, description, mimeType })),
+      });
+      if (message.method === "resources/templates/list") return result({ resourceTemplates: [] });
+      if (message.method === "resources/read") {
+        const found = taskfileResources.find(({ uri }) => uri === message.params?.uri);
+        if (!found) return fail(-32002, "Resource not found");
+        const { uri, text, mimeType } = found;
+        return result({ contents: [{ uri, text, mimeType }] });
+      }
       if (message.method === "tools/list") return result({ tools: Object.keys(tools).sort()
         .map((name) => ({ name, description: tools[name][0], inputSchema: tools[name][1] })) });
       if (message.method !== "tools/call") return fail(-32601, "Method not found");
@@ -144,7 +166,8 @@ async function serve(options, env) {
       if (!Object.hasOwn(tools, name)) return fail(-32602, "Unknown tool");
       try {
         const value = await tools[name][2](message.params.arguments ?? {}, signal);
-        return result({ content: [{ type: "text", text: JSON.stringify(value) }], structuredContent: value });
+        const text = name === "taskfile_help" && value.markdown ? value.markdown : JSON.stringify(value);
+        return result({ content: [{ type: "text", text }], structuredContent: value });
       } catch (error) {
         return result({ isError: true, content: [{ type: "text", text: error.message }] });
       }
@@ -224,7 +247,12 @@ async function* lines(input, signal) {
 try {
   const options = parseCli(process.argv.slice(2));
   switch (options.command) {
-    case "help": console.log(usage); break;
+    case "help": console.log(options.text); break;
+    case "taskfile": {
+      const help = taskfileHelp(options.action);
+      console.log(help.markdown ?? JSON.stringify(help.schemas ?? help.files, null, 2));
+      break;
+    }
     case "version": console.log(pkg.version); break;
     case "init": console.log(JSON.stringify(await initializeCli(options), null, 2)); break;
     case "auth": console.log(JSON.stringify(await authCommand(options, process.env), null, 2)); break;

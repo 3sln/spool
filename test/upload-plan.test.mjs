@@ -2,10 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createHash } from "node:crypto";
 import { createClient, layerDescriptor, TAR } from "../client/index.mjs";
-import { BASE, LIMITS } from "../src/contract.mjs";
-import { nodeHandler } from "../src/node.mjs";
+import { BASE, LIMITS, createRunnerCore } from "../src/core.mjs";
 import { directSingleBytes, directTransfers } from "../src/r2-transfer.mjs";
-import { TaskService } from "../src/service.mjs";
 import { openData } from "../src/sqlite.mjs";
 
 test("direct upload plans scope signed parts and require proof of content before queueing", async (t) => {
@@ -56,11 +54,11 @@ test("direct upload plans scope signed parts and require proof of content before
       return sha.digest("hex");
     },
   });
-  const service = new TaskService(database.store, {
-    has: driver.head, open: (key) => driver.get(key)?.body, delete: driver.delete,
-  }, { transfers, limits: LIMITS });
-  const runner = nodeHandler(service, {
-    profile: "fixture", authenticate: async () => ({ issuer: "fixture", subject: "owner" }),
+  const { fetch: runner } = createRunnerCore({
+    auth: { profile: "fixture", authenticate: async () => ({ issuer: "fixture", subject: "owner" }) },
+    execution: { network: "fixture", cpu: "fixture", memory: "fixture", disk: "fixture" },
+    store: database.store, transfers,
+    layers: { has: driver.head, open: (key) => driver.get(key)?.body, delete: driver.delete },
   });
   let urls = 0;
   const fetch = async (url, options) => {
@@ -81,6 +79,9 @@ test("direct upload plans scope signed parts and require proof of content before
   };
   const logIn = { url: "https://runner.test", headers: { authorization: "Bearer fixture-token" }, fetch };
   const client = createClient({ ...logIn, allowTransferURL: (url) => url.origin === "https://fixture.object-store.test" });
+  const capabilities = await client.capabilities();
+  assert.deepEqual(capabilities.upload_transports, ["presigned-put", "presigned-multipart"]);
+  assert.equal(capabilities.limits.max_artifact_bytes_total, 512 * 1024);
   for (const size of [4050, directSingleBytes + 1]) {
     const bytes = new Blob([new Uint8Array(size)]);
     const descriptor = await layerDescriptor(new Uint8Array(await bytes.arrayBuffer()), TAR);

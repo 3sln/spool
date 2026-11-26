@@ -28,7 +28,7 @@ const packages = [
       bin: { "spool-runner": "./bin/runner.mjs" },
       exports: {
         ".": "./src/node.mjs", "./node": "./src/node.mjs", "./worker": "./src/worker.mjs",
-        "./contract": "./src/contract.mjs", "./guest/Dockerfile": "./guest/Dockerfile",
+        "./core": "./src/core.mjs", "./contract": "./src/contract.mjs", "./guest/Dockerfile": "./guest/Dockerfile",
       },
       optionalDependencies: source.optionalDependencies,
       dependencies: source.dependencies,
@@ -40,7 +40,7 @@ const packages = [
       name: "@3sln/spool-mcp", description: "Stdio MCP client for Spool runners",
       bin: { "spool-mcp": "./bin/mcp.mjs" }, publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
     },
-    files: [...clientFiles, "bin/mcp.mjs", "bin/mcp-config.mjs", "bin/mcp-auth.mjs", "bin/oauth.mjs"],
+    files: [...clientFiles, "bin/mcp.mjs", "bin/mcp-config.mjs", "bin/mcp-auth.mjs", "bin/mcp-help.mjs", "bin/taskfile-help.mjs", "bin/oauth.mjs"],
   },
 ];
 

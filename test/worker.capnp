@@ -13,6 +13,7 @@ const config :Workerd.Config = (
       ],
       bindings = [
         (name = "SPOOL_TOKEN", text = "token-only-used-by-the-local-workerd-test"),
+        (name = "SPOOL_CONTAINER_IMAGE", text = "guest"),
         (name = "TENANTS", durableObjectNamespace = (className = "TestedTenantRunner")),
         (name = "GUESTS", durableObjectNamespace = (className = "GuestFixture")),
         (name = "BLOB_DATA", durableObjectNamespace = (className = "BlobData")),

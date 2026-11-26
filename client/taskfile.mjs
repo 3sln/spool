@@ -7,6 +7,7 @@ const maxTemplateBytes = 128 * 1024;
 const map = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const string = (value) => typeof value === "string" && value.length > 0 && value.isWellFormed() && !value.includes("\0");
 const name = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+const resourceFields = ["cpu", "memory_mib", "disk_mib"];
 const workspacePath = (path) => string(path) && (path === "/workspace" || (
   path.startsWith("/workspace/") && path.slice(11).split("/").every((part) => part && part !== "." && part !== "..")
 ));
@@ -36,7 +37,7 @@ async function regularFile(path, maximum) {
 }
 
 function requirements(target, requirements = {}) {
-  fields(requirements, ["platform", "base", "features", "limits"], "requires");
+  fields(requirements, ["platform", "base", "features", "limits", "resources"], "requires");
   for (const key of ["platform", "base"]) {
     const value = requirements[key];
     if (value === undefined) continue;
@@ -52,6 +53,13 @@ function requirements(target, requirements = {}) {
     for (const [limit, minimum] of Object.entries(requirements.limits)) {
       if (!Number.isSafeInteger(minimum) || minimum < 0 || !name.test(limit)) throw new TypeError("Invalid requires.limits minimum");
       target.limits.set(limit, Math.max(target.limits.get(limit) ?? 0, minimum));
+    }
+  }
+  if (requirements.resources !== undefined) {
+    fields(requirements.resources, resourceFields, "requires.resources");
+    for (const [field, minimum] of Object.entries(requirements.resources)) {
+      if (!Number.isSafeInteger(minimum) || minimum < 1) throw new TypeError(`Invalid requires.resources.${field} minimum`);
+      target.resources[field] = Math.max(target.resources[field] ?? 0, minimum);
     }
   }
 }
@@ -115,7 +123,7 @@ export async function prepareTaskFile(file, {
   const root = await realpath(contextRoot);
   if (!cache.leasePath && typeof cache.forWorkspace === "function") cache = await cache.forWorkspace(root);
   const entry = await scopedPath(root, root, relative(resolve(contextRoot), resolve(file)));
-  const required = { features: new Set(), limits: new Map() };
+  const required = { features: new Set(), limits: new Map(), resources: {} };
   const done = new Set();
   const visiting = new Set();
   const recipes = new Map();
@@ -187,9 +195,14 @@ export async function prepareTaskFile(file, {
   if (taskTimeout === undefined) throw new TypeError("The Taskfile or a base must supply task_timeout_s");
   if (taskTimeout > (limits.max_task_seconds ?? Infinity)) throw new RangeError("Task timeout exceeds the runner limit");
   resources = { ...discovery.resource_profile, ...resources };
-  for (const field of ["cpu", "memory_mib", "disk_mib"]) {
+  for (const field of resourceFields) {
     if (!Number.isInteger(resources[field]) || resources[field] <= 0) throw new TypeError(`Invalid resource request: ${field}`);
     if (discovery.resource_profile?.[field] !== undefined && resources[field] !== discovery.resource_profile[field]) throw new Error(`Runner does not offer requested resources.${field}`);
+  }
+  const minimum = Object.entries(required.resources);
+  const available = discovery.resource_profiles ?? [resources];
+  if (minimum.length && !available.some((offer) => minimum.every(([field, amount]) => offer[field] >= amount))) {
+    throw new RangeError(`No advertised runner profile satisfies requires.resources ${JSON.stringify(required.resources)}`);
   }
   if (resources.timeout_s !== undefined && (!Number.isSafeInteger(resources.timeout_s) || resources.timeout_s < 1
     || resources.timeout_s > (limits.max_job_seconds ?? Infinity))) throw new Error("Command timeout is outside the runner limits");
@@ -243,7 +256,8 @@ export async function prepareTaskFile(file, {
   const manifest = {
     protocol_version: "0.1", client_request_id: requestId, task_timeout_s: taskTimeout, platform: selected.platform,
     environment: { base: selected.base, layers: evaluated.map(({ descriptor }) => descriptor) },
-    command, resources, network: { mode: "none" }, ...(outputs ? { outputs } : {}),
+    command, resources, ...(minimum.length && discovery.resource_profiles && { min_resources: required.resources }),
+    network: { mode: "none" }, ...(outputs ? { outputs } : {}),
   };
   return { manifest, layers: evaluated };
 }

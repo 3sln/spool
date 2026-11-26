@@ -5,7 +5,8 @@ import { dirname } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
-import { publicEndpoint, taskEndpoint } from "./api.mjs";
+import { taskEndpoint } from "./api.mjs";
+import { createRunnerHandler } from "./core.mjs";
 import { bearer, configuredAuth, staticToken } from "./auth.mjs";
 import { configuredLimits, json, readJSON, taskPattern } from "./contract.mjs";
 import { EXECUTION, ociExecutor } from "./oci.mjs";
@@ -14,10 +15,10 @@ import { TaskService } from "./service.mjs";
 import { openData } from "./sqlite.mjs";
 import { fileBlobs } from "./file-blobs.mjs";
 
-export function nodeHandler(service, auth, { origins = [], workerAuth } = {}) {
-  const publicAPI = publicEndpoint(auth, origins, EXECUTION, (request, tenant) => {
-    return taskEndpoint(request, tenant, service);
-  }, service.limits);
+export function nodeHandler(service, auth, { origins = [], workerAuth, execution = EXECUTION } = {}) {
+  const publicAPI = createRunnerHandler({
+    auth, origins, execution, limits: service.limits, dispatch: (request, tenant) => taskEndpoint(request, tenant, service),
+  });
   return async (request) => {
     const path = new URL(request.url).pathname;
     if (!path.startsWith("/internal/")) return publicAPI(request);
@@ -76,7 +77,9 @@ export async function start(env = process.env, overrides = {}) {
   const service = new TaskService(data.store, objectStorage?.blobs ?? localBlobs, {
     concurrency: workers, limits, transfers: objectStorage?.transfers, artifactStorage: localBlobs,
   });
-  const handler = nodeHandler(service, auth, { origins: env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], workerAuth });
+  const handler = nodeHandler(service, auth, {
+    origins: env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], workerAuth, execution: overrides.execution,
+  });
   const executor = overrides.executor ?? ociExecutor(env);
   const active = new Map();
   let scheduling = false;

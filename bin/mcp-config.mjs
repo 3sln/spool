@@ -1,6 +1,8 @@
 import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { helpFor } from "./mcp-help.mjs";
+import { taskfileTopics } from "./taskfile-help.mjs";
 
 const defaults = {
   project: ".mcp.json",
@@ -8,23 +10,6 @@ const defaults = {
   cursor: ".cursor/mcp.json",
 };
 const modes = new Set(["shared", "isolated", "custom"]);
-const usage = `Usage:
-  spool-mcp [serve] [--runner URL] [--profile NAME] [--workspace PATH]
-            [--state-mode shared|isolated|custom] [--state-dir PATH]
-  spool-mcp init [--client project|claude|cursor] [--config PATH]
-                 [--runner URL] [--profile NAME] [--workspace PATH] [--state-mode MODE]
-                 [--state-dir PATH] [--name NAME] [--force] [--dry-run]
-  spool-mcp cache-gc [--state-dir PATH]
-  spool-mcp auth login --profile NAME --runner URL
-                [--scheme bearer|oauth] [--token-stdin]
-                [--issuer URL] [--client-id ID] [--scope SCOPE] [--redirect-port PORT]
-  spool-mcp auth list
-  spool-mcp auth logout --profile NAME
-  spool-mcp --version
-
-Use a profile or SPOOL_TOKEN in the MCP host environment.
-init writes startup arguments only.`;
-
 const serveFlags = ["runner", "profile", "workspace", "state-mode", "state-dir"];
 const initFlags = [...serveFlags, "client", "config", "name", "force", "dry-run"];
 
@@ -47,13 +32,21 @@ function normalizeState(mode, directory) {
 
 export function parseCli(args) {
   const result = { command: "serve" };
+  const showHelp = (topic) => ({ command: "help", text: helpFor(topic) });
+  const isHelp = (arg) => arg === "--help" || arg === "-h";
   if (args[0] === "--version") return { command: "version" };
-  if (["init", "serve", "cache-gc", "auth"].includes(args[0])) result.command = args.shift();
-  if (args[0] === "--help" || args[0] === "-h") return { command: "help" };
+  if (args[0] === "help") return showHelp(isHelp(args[1]) ? "" : args.slice(1).join(" "));
+  let topic = "";
+  if (["init", "serve", "cache-gc", "auth", "taskfile"].includes(args[0])) {
+    result.command = args.shift();
+    topic = result.command;
+  }
+  if (isHelp(args[0])) return showHelp(topic);
   let allowed = serveFlags;
   if (result.command === "init") allowed = initFlags;
   if (result.command === "cache-gc") allowed = ["state-dir"];
   if (result.command === "auth") {
+    if (!args.length) return showHelp(topic);
     result.action = args.shift();
     const authFlags = {
       login: ["runner", "profile", "scheme", "token-stdin", "issuer", "client-id", "scope", "redirect-port"],
@@ -61,8 +54,16 @@ export function parseCli(args) {
       list: [],
     };
     if (!Object.hasOwn(authFlags, result.action)) throw new TypeError("Use auth login, auth list, or auth logout");
+    topic += " " + result.action;
     allowed = authFlags[result.action];
   }
+  if (result.command === "taskfile") {
+    result.action = args.shift() ?? "guide";
+    if (!taskfileTopics.includes(result.action)) throw new TypeError("Use taskfile guide, taskfile schema, or taskfile example");
+    topic += " " + result.action;
+    allowed = [];
+  }
+  if (args.some(isHelp)) return showHelp(topic);
   while (args.length) {
     const flag = args.shift();
     const key = flag.startsWith("--") ? flag.slice(2) : "";
@@ -159,5 +160,3 @@ export async function initializeCli(options) {
     await Promise.all([rm(lock, { force: true }), rm(temporary, { force: true })]);
   }
 }
-
-export { usage };

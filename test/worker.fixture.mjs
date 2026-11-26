@@ -71,7 +71,13 @@ export class GuestFixture extends DurableObject {
     }
     if (url.pathname !== "/start") return new Response(null, { status: 404 });
     const payload = await request.text();
-    if (payload.slice(payload.indexOf("\n") + 1) !== "tar") throw new Error("Expected bytes forwarded through the R2 adapter");
+    const separator = payload.indexOf("\n");
+    if (payload.slice(separator + 1) !== "tar") throw new Error("Expected bytes forwarded through the R2 adapter");
+    const work = JSON.parse(payload.slice(0, separator));
+    if (request.headers.get("x-spool-resource-profile") !== "standard-3" || work.manifest.resources.cpu !== 2
+      || work.manifest.resources.memory_mib !== 6144 || work.manifest.resources.disk_mib !== 12000) {
+      throw new Error("Expected selected profile and effective guest resources");
+    }
     await this.ctx.storage.put("started", true);
     return new Response(null, { status: 202 });
   }
@@ -87,14 +93,25 @@ export default {
       command: { argv: ["true"], cwd: "/workspace" }, network: { mode: "none" },
       outputs: { paths: ["/workspace/artifact"] },
       resources: { cpu: 1, memory_mib: 256, disk_mib: 4096 },
+      min_resources: { cpu: 2, memory_mib: 6144, disk_mib: 12000 },
     };
     const call = (path, method = "GET", body) => worker.fetch(new Request(`https://spool.example${path}`, {
       method, body, headers: { authorization: `Bearer ${env.SPOOL_TOKEN}` },
     }), env);
+    const info = await (await call("/.well-known/portable-task-runner")).json();
+    if (info.resource_profiles.map(({ name }) => name).join(",") !== "standard-2,standard-3,standard-4") {
+      throw new Error("Expected enabled Cloudflare profiles in discovery");
+    }
+    const rejected = await call("/v1/tasks", "POST", JSON.stringify({ ...manifest, min_resources: { cpu: 5 } }));
+    if (rejected.status !== 422 || (await rejected.json()).error !== "RESOURCE_LIMIT") {
+      throw new Error("Expected admission to reject an oversized task");
+    }
     const post = await call("/v1/tasks", "POST", JSON.stringify(manifest));
     if (post.status !== 202) throw new Error(`Submit failed: ${post.status} ${await post.text()}`);
     const initial = await post.json();
-    if (initial.state !== "WAITING_FOR_LAYER") throw new Error("Expected a cache miss");
+    if (initial.state !== "WAITING_FOR_LAYER" || initial.resource_profile?.name !== "standard-3") {
+      throw new Error("Expected a cache miss with standard-3 selected");
+    }
     const offer = await call(`${initial.links.self}/layers/${digest}/upload`, "POST");
     const uploaded = await call((await offer.json()).url, "PUT", bytes);
     if (uploaded.status !== 200) throw new Error(`Upload failed: ${uploaded.status} ${await uploaded.text()}`);

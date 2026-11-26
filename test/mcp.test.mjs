@@ -93,3 +93,74 @@ test("init preserves unrelated servers and supports shared, custom and isolated 
   await isolated.close();
   await assert.rejects(stat(isolated.blobs), { code: "ENOENT" });
 });
+
+test("CLI and MCP expose Taskfile semantics, schemas, and the same runnable example", async (t) => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdir } = await import("node:fs/promises");
+  const { prepareTaskFile } = await import("../client/taskfile.mjs");
+  const { capabilities } = await import("../src/contract.mjs");
+  const run = (args, input) => {
+    const child = spawnSync(process.execPath, ["bin/mcp.mjs", ...args], {
+      input, encoding: "utf8",
+      env: { ...process.env, SPOOL_WORKSPACE_ROOT: "", SPOOL_BLOB_DIR: "", SPOOL_PROFILE: "", SPOOL_URL: "" },
+    });
+    assert.equal(child.status, 0, child.stderr);
+    return child.stdout;
+  };
+
+  for (const [command, expected] of [
+    [["serve"], /MCP JSON-RPC on stdin\/stdout/],
+    [["init"], /\.cursor\/mcp\.json/],
+    [["auth"], /Profiles bind credentials/],
+    [["auth", "login"], /--token-stdin/],
+    [["auth", "list"], /known expiry/],
+    [["auth", "logout"], /Remove the local credentials/],
+    [["cache-gc"], /unexpired workspace lease/],
+    [["taskfile"], /runnable example/],
+    [["taskfile", "example"], /map of relative filenames/],
+  ]) assert.match(run([...command, "--help"]), expected);
+  assert.equal(run(["help", "auth", "login"]), run(["auth", "login", "--help"]));
+  assert.match(run(["taskfile"]), /Inheritance and requirements/);
+  const example = JSON.parse(run(["taskfile", "example"]));
+  const schemas = JSON.parse(run(["taskfile", "schema"]));
+  assert.ok(schemas["taskfile.schema.json"].$defs.layer);
+  assert.ok(schemas["manifest.schema.json"].$defs.workspacePath);
+  assert.equal(schemas["taskfile.schema.json"].properties.outputs.$ref,
+    schemas["manifest.schema.json"].$id + "#/properties/outputs");
+
+  const requests = [
+    ["initialize", { protocolVersion: "2025-11-25" }],
+    ["server/discover", { _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } }],
+    ["tools/list", {}],
+    ["tools/call", { name: "taskfile_help", arguments: { topic: "example" } }],
+    ["resources/list", {}],
+    ["resources/read", { uri: "spool://taskfile/guide" }],
+    ["resources/read", { uri: "spool://taskfile/taskfile.schema.json" }],
+    ["resources/read", { uri: "file:///etc/passwd" }],
+  ];
+  const input = requests.map(([method, params], id) => JSON.stringify({ jsonrpc: "2.0", id, method, params })).join("\n") + "\n";
+  const replies = new Map(run(["serve", "--state-mode", "isolated"], input).trim().split("\n").map((line) => {
+    const reply = JSON.parse(line);
+    return [reply.id, reply];
+  }));
+  assert.deepEqual(replies.get(0).result.capabilities.resources, {});
+  assert.match(replies.get(0).result.instructions, /taskfile_help/);
+  assert.deepEqual(replies.get(1).result.capabilities.resources, {});
+  assert.ok(replies.get(2).result.tools.some(({ name }) => name === "taskfile_help"));
+  assert.deepEqual(replies.get(3).result.structuredContent.files, example);
+  assert.equal(replies.get(4).result.resources.length, 4);
+  assert.match(replies.get(5).result.contents[0].text, /task_timeout_s/);
+  assert.deepEqual(JSON.parse(replies.get(6).result.contents[0].text), schemas["taskfile.schema.json"]);
+  assert.equal(replies.get(7).error.code, -32002);
+
+  const project = await mkdtemp(join(tmpdir(), "spool-example-"));
+  t.after(() => rm(project, { recursive: true, force: true }));
+  await mkdir(join(project, "input"));
+  for (const [path, contents] of Object.entries(example)) await writeFile(join(project, path), contents);
+  const cache = await openLayerCache(join(project, "cache"));
+  const info = capabilities("test", {});
+  const { manifest, layers } = await prepareTaskFile(join(project, "Taskfile.json"), { cache, runner: info });
+  assert.equal(manifest.task_timeout_s, 180);
+  assert.equal(layers[0].id, "input");
+  assert.deepEqual(manifest.outputs.paths, ["/workspace/result.txt"]);
+});

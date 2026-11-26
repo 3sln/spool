@@ -36,6 +36,8 @@ try {
   };
   const options = { cwd: workspace, env };
   assert.equal(run(executable, ["--version"], options).trim(), pkg.version);
+  assert.match(run(executable, ["auth", "login", "--help"], options), /--token-stdin/u);
+  assert.ok(JSON.parse(run(executable, ["taskfile", "example"], options))["Taskfile.json"]);
   const message = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "build_layer", arguments: { directory: "." } } };
   const reply = JSON.parse(run(executable, [], { ...options, input: JSON.stringify(message) + "\n" }));
   assert.match(reply.result?.structuredContent?.digest ?? "", /^sha256:[a-f0-9]{64}$/u, JSON.stringify(reply));

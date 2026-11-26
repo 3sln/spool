@@ -57,6 +57,10 @@ Set `SPOOL_S3_BUCKET` to use an existing private S3-compatible bucket for the la
 
 OAuth mode publishes protected-resource metadata. Token issuance, client registration, and consent are the responsibility of the configured issuer. Access mode uses clients that can present Access credentials or use an Access integration. The client library accepts a per-request header callback for refreshed tokens and custom authentication. Tenant keys derive from authenticated issuer and subject.
 
+## Custom runner providers
+
+Import `createRunnerCore` from `@3sln/spool-runner/core` to use Spool's HTTP API and task lifecycle with your own state store, layer cache, artifact store, authentication, and scheduler. It returns a Fetch handler and a task service. Mount the handler in your application and drive the service from your job loop or queue consumer. The turnkey Node SDK also accepts `executor` and `execution` overrides for in-process execution. See the [provider contracts and scheduling examples](protocol/runner-core.md).
+
 ## Client libraries
 
 Import `@3sln/spool-client` for the Fetch-based client and byte-level OCI layer builder. Import `@3sln/spool-client/node` for the Node or Bun filesystem cache and directory builder. The `include` callback can exclude local files before packaging, including entire directories.
@@ -104,7 +108,15 @@ Kin generates the event replay policy to JavaScript and Rust. The [Rust SDK](sdk
 
 ## JSON Taskfiles
 
-Check in [a task](examples/taskfiles/check.json), [a reusable base](examples/taskfiles/debian-base.json), and the sources or preparation steps that build the layers. The [Taskfile schema](protocol/taskfile.schema.json) describes the format. Bases can extend other bases. The client visits ancestors in the order listed and includes a shared ancestor once. It appends each file's layers in order. Layer IDs identify the recipes within the assembled task. The child can override the inherited task timeout, command, or resource fields. Runner requirements accumulate, with exact matches for platform and logical base ID, a union of features, and the highest minimum for each limit.
+Run `spool-mcp taskfile` for syntax, inheritance rules, and the submission
+workflow. `spool-mcp taskfile schema` prints both JSON schemas.
+`spool-mcp taskfile example` prints a map of filenames to runnable file
+contents. Agents can call `taskfile_help` with `guide`, `schema`, or `example`,
+or browse the `spool://taskfile/` MCP resources.
+
+Check in [a task](examples/taskfiles/check.json), [a reusable base](examples/taskfiles/debian-base.json), and the sources or preparation steps that build the layers. The [Taskfile schema](protocol/taskfile.schema.json) describes the format. Bases can extend other bases. The client visits ancestors in the order listed and includes a shared ancestor once. It appends each file's layers in order. Layer IDs identify the recipes within the assembled task. The child can override the inherited task timeout, command, or resource fields. Runner requirements accumulate, with exact matches for platform and logical base ID, a union of features, and the highest minimum for each limit or resource.
+
+Set `requires.resources` on a task or base when it needs more CPU, memory, or workspace disk than the defaults. For example, `"requires": { "resources": { "cpu": 2, "memory_mib": 4096, "disk_mib": 8192 } }`. The compiler checks the runner's advertised profiles before building layers. The runner independently checks the submitted minima before accepting the task. Task status reports the selected profile and effective budgets.
 
 Call the library to resolve runner capabilities, build the ordered layers, and merge their SHA-256 descriptors into the manifest.
 
@@ -131,6 +143,9 @@ Install `spool-mcp` and initialize the project configuration.
 ```sh
 spool-mcp init --runner http://127.0.0.1:8787 --workspace .
 ```
+
+Use `spool-mcp --help` for the workflow, or pass `--help` to a command such
+as `init`, `serve`, or `auth login` for its options and examples.
 
 The default writes `.mcp.json`. Use `--client cursor` for `.cursor/mcp.json`,
 `--config PATH` for a custom JSON config, or `--dry-run` to see the proposed
@@ -202,7 +217,7 @@ export default createWorkerRunner();
 
 In your application’s config, bind a SQLite Durable Object namespace named `TENANTS` to `TenantRunner` and another named `GUESTS` to the container-backed `GuestSlot`. Bind an R2 bucket as `LAYERS`. The guest image recipe and build context are in the installed runner package under `guest/`. The Dockerfile is also available through `@3sln/spool-runner/guest/Dockerfile`. Configure the app’s routing, auth, and container settings in your deployment. Use `createWorkerRunner({ auth: (env) => adapter })` to supply a custom authentication adapter. For Access service credentials use `SPOOL_ACCESS_CLIENT_ID` and `SPOOL_ACCESS_CLIENT_SECRET` with the smoke client.
 
-For the [Durable Object scheduling policy](https://developers.cloudflare.com/containers/configuration/scheduling-policy/), configure a named guest image under `containers[].images` and set `SPOOL_CONTAINER_IMAGE` to that name. `SPOOL_CONTAINER_INSTANCE` defaults to `standard-2`. If your existing application uses the default scheduling policy, the app configuration determines the guest image and instance size. Leave both variables unset for that policy.
+For the [Durable Object scheduling policy](https://developers.cloudflare.com/containers/configuration/scheduling-policy/), configure a named guest image under `containers[].images` and set `SPOOL_CONTAINER_IMAGE` to that name. `SPOOL_CONTAINER_INSTANCE` sets the default for tasks without hints and defaults to `standard-2`. Workers choose the smallest enabled tier that fits a task's minima. Supported tiers are `standard-2`, `standard-3`, and `standard-4`. By default, the runner enables the default tier and larger ones. Set `SPOOL_CONTAINER_INSTANCES` to a comma-separated allowlist that includes the default to restrict which tiers can launch. The advertised budgets reserve 256 MiB of VM memory and 1 GiB of disk for overhead. The guest applies the effective task address-space and workspace budgets. A deployment using Cloudflare's default scheduling policy has a fixed profile set by the app configuration.
 
 A SQLite Durable Object queues one running task per tenant. R2 caches layers by tenant and digest. A separate container-bound object starts a fresh VM per attempt with Internet access disabled. The native guest runs the command independently. Short Durable Object alarms poll logs and results, resume from the persisted cursor, and stop the VM at expiry or completion. The guest also stops when its hard deadline passes or after two minutes without coordinator contact.
 
