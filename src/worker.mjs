@@ -23,6 +23,7 @@ function workerLimits(env, { layers, artifacts, transfers }) {
     ? { uploads: ["presigned-put", "presigned-multipart"] }
     : { layerCeiling: 32, defaultLayer: 32 });
   return { ...limits, ...workerResourcePolicy(env),
+    patch_layers: true,
     artifact_layer_sources: Boolean(artifacts && (layers.importVerified || layers.putVerified)),
     artifact_presigned_get: typeof artifacts?.presignDownload === "function",
   };

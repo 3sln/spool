@@ -275,4 +275,4 @@ export function createClient({
   };
 }
 
-export { buildLayer, layerDescriptor, TAR, TAR_GZIP } from "./layers.mjs";
+export { buildLayer, layerDescriptor, PATCH_MEDIA, TAR, TAR_GZIP } from "./layers.mjs";

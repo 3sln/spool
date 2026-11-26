@@ -61,6 +61,7 @@ export async function start(env = process.env, overrides = {}) {
   const objectStorage = env.SPOOL_S3_BUCKET ? await (await import("./s3-storage.mjs")).s3Storage(env) : undefined;
   const limits = configuredLimits(env, objectStorage ? { uploads: ["presigned-put", "presigned-multipart"] } : undefined);
   limits.artifact_layer_sources = true;
+  limits.patch_layers = overrides.executor === undefined;
   limits.artifact_presigned_get = Boolean(objectStorage);
   const workers = Number(env.SPOOL_CONCURRENCY ?? 1);
   const port = Number(env.PORT ?? 8787);

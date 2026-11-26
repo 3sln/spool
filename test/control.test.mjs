@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
 import { test } from "node:test";
 import { nodeHandler } from "../src/node.mjs";
-import { buildLayer, createClient } from "../client/index.mjs";
+import { buildLayer, createClient, layerDescriptor, PATCH_MEDIA } from "../client/index.mjs";
 import { buildDirectoryLayer, openLayerCache } from "../client/node.mjs";
 import { prepareTaskFile, runTaskFile } from "../client/taskfile.mjs";
 import { configuredAuth, jwtVerifier, staticToken, tenantFor } from "../src/auth.mjs";
@@ -384,6 +385,157 @@ test("Taskfiles resolve inherited recipes and runner requirements before uploadi
   await write("cycle.json", { kind: "base", extends: ["cycle.json"] });
   await write("task.json", { kind: "task", extends: ["cycle.json"] });
   await assert.rejects(prepareTaskFile(taskfile, { client, cache }), /inheritance cycle/);
+});
+
+test("mapped sources send binary patches and recreate the current workspace", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "spool-source-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = join(root, "project");
+  const source = join(project, "source");
+  const sibling = join(root, "sibling");
+  const taskfile = join(project, "Taskfile.json");
+  await mkdir(source, { recursive: true });
+  await mkdir(sibling);
+  const payload = randomBytes(200 * 1024);
+  await writeFile(join(source, "large.dat"), payload);
+  await writeFile(join(source, "obsolete"), "old");
+  await writeFile(join(source, "skip"), "excluded");
+  await symlink("large.dat", join(source, "relative"));
+  await writeFile(join(sibling, "dependency"), "from sibling");
+  const spec = {
+    version: "0.1", kind: "task", task_timeout_s: 30,
+    layers: [{ id: "source", kind: "sources", sources: [
+      { path: "source", destination: "/workspace/app", exclude: ["skip"] },
+      { path: "../sibling", destination: "/workspace/shared" },
+    ] }],
+    command: { argv: ["sh", "-ec", "test -L app/relative; test ! -e app/skip; test -f shared/dependency"] },
+    outputs: { paths: ["/workspace/app/large.dat"] },
+  };
+  const putSpec = () => writeFile(taskfile, JSON.stringify(spec));
+  await putSpec();
+  const cache = await openLayerCache(join(root, "cache"));
+  const data = openData(":memory:");
+  t.after(() => data.close());
+  const service = new TaskService(data.store, data.blobs, {
+    limits: { ...configuredLimits({}), patch_layers: true },
+  });
+  const handler = nodeHandler(service, auth);
+  const supplied = [];
+  const client = createClient({ url: "https://spool.test", headers: { "x-fixture-user": "alice" },
+    fetch: (url, options) => {
+      if (options.method === "PUT") supplied.push(url.pathname);
+      return handler(new Request(url, options));
+    },
+  });
+  await assert.rejects(prepareTaskFile(taskfile, { cache, client }), /sibling.*outside the configured source roots/);
+  const options = { client, cache, sourceRoots: [sibling], signal: AbortSignal.timeout(20000) };
+  async function runPrepared(opts = options) {
+    const { manifest: request } = await prepareTaskFile(taskfile, opts);
+    const task = await client.submit(request);
+    const scoped = await cache.forWorkspace(project);
+    await client.supply(task.task_id, task.required, { source: scoped.open, plans: task.upload_plans });
+    await service.run(task.task_id, runGuest);
+    const terminal = await client.status(task.task_id);
+    await assertSucceeded(terminal, () => client.eventPage(task.task_id));
+    return { request, task, terminal };
+  }
+  const first = await runPrepared();
+  assert.equal(first.request.environment.layers.length, 2);
+  const copy = join(root, "other-checkout");
+  await cp(project, copy, { recursive: true, verbatimSymlinks: true });
+  const clean = await prepareTaskFile(join(copy, "Taskfile.json"), { ...options, cache: await openLayerCache(join(root, "clean")) });
+  assert.deepEqual(clean.manifest.environment.layers, first.request.environment.layers);
+
+  payload[181] ^= 1;
+  payload[170001] ^= 2;
+  await writeFile(join(source, "large.dat"), payload);
+  await rm(join(source, "obsolete"));
+  spec.command.argv[2] += "; test ! -e app/obsolete";
+  await putSpec();
+  supplied.length = 0;
+  const second = await runPrepared();
+  assert.equal(second.task.required.length, 1);
+  assert.equal(supplied.length, 1);
+  const [patch] = second.task.required;
+  assert.equal(patch.media_type, PATCH_MEDIA);
+  assert.ok(patch.size < 1024, `Expected a small byte patch, got ${patch.size}`);
+  const { artifacts: [result] } = await client.artifacts(second.task.task_id);
+  assert.equal(await sha256(await (await client.download(result)).arrayBuffer()), await sha256(payload));
+  const bad = Buffer.from(await (await cache.forWorkspace(project)).source(patch));
+  bad[8] ^= 1;
+  const broken = await layerDescriptor(bad, PATCH_MEDIA);
+  const layers = [...second.request.environment.layers];
+  layers[1] = broken;
+  const mismatch = await client.submit({ ...second.request, client_request_id: "bad-target-hash",
+    environment: { ...second.request.environment, layers },
+  });
+  await client.supply(mismatch.task_id, mismatch.required, { source: () => bad, plans: mismatch.upload_plans });
+  await service.run(mismatch.task_id, runGuest);
+  const invalid = await client.status(mismatch.task_id);
+  assert.equal(invalid.result.layer_error.digest, broken.digest);
+  assert.match(invalid.result.layer_error.reason, /reconstructed archive length or SHA-256 mismatch/);
+
+  spec.layers[0].diff = { format: "git", argv: ["git", "diff", "--no-index", "--binary", "--", "{base}", "{current}"] };
+  await putSpec();
+  await assert.rejects(prepareTaskFile(taskfile, options), /requires --allow-source-diff-command/);
+  payload[12001] ^= 8;
+  await writeFile(join(source, "large.dat"), payload);
+  const third = await runPrepared({ ...options, allowSourceDiffCommand: true });
+  assert.equal(third.request.environment.layers[1].media_type, PATCH_MEDIA);
+  assert.equal(third.request.environment.layers[2].media_type, PATCH_MEDIA);
+  assert.equal(third.task.required.length, 1);
+  assert.ok(third.task.required[0].size < patch.size);
+
+  delete spec.layers[0].diff;
+  await writeFile(join(source, "large.dat"), randomBytes(payload.length));
+  await putSpec();
+  const refreshed = await runPrepared();
+  assert.equal(refreshed.request.environment.layers[0].media_type, MEDIA[0]);
+  assert.notEqual(refreshed.request.environment.layers[0].digest, first.request.environment.layers[0].digest);
+});
+
+test("source archives split at entry boundaries and obey the combined input limit", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "spool-source-packing-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const input = join(root, "input");
+  await mkdir(input);
+  const a = randomBytes(8000);
+  await writeFile(join(input, "a.bin"), a);
+  await writeFile(join(input, "b.bin"), randomBytes(8000));
+  const file = join(root, "Taskfile.json");
+  const spec = {
+    version: "0.1", kind: "task", task_timeout_s: 30, command: { argv: ["true"] },
+    layers: [{ id: "source", kind: "sources", sources: [{ path: "input", destination: "/workspace/app" }] }],
+  };
+  await writeFile(file, JSON.stringify(spec));
+  const runner = {
+    protocol_versions: ["0.1"], platforms: ["linux/amd64"], bases: [BASE], layer_media_types: [...MEDIA, PATCH_MEDIA],
+    resource_profile: { cpu: 1, memory_mib: 256, disk_mib: 4096 },
+    limits: { max_layers: 2, max_layer_bytes: 12 * 1024, max_input_bytes: 24 * 1024 },
+  };
+  const cache = await openLayerCache(join(root, "cache"));
+  const snapshot = await prepareTaskFile(file, { runner, cache });
+  assert.equal(snapshot.layers.length, 2);
+  assert.ok(snapshot.layers.every(({ descriptor }) => descriptor.size <= runner.limits.max_layer_bytes));
+  await assert.rejects(prepareTaskFile(file, { cache, runner: { ...runner,
+    limits: { ...runner.limits, max_layers: 1 },
+  } }), /source.*input.*layer count/);
+  await mkdir(join(root, "trailing"));
+  await writeFile(join(root, "trailing", "file.bin"), randomBytes(3000));
+  spec.layers.push({ id: "trailing", kind: "directory", path: "trailing" });
+  await writeFile(file, JSON.stringify(spec));
+  const mixed = { ...runner, limits: { ...runner.limits, max_layers: 4, max_input_bytes: 32 * 1024 } };
+  const full = await prepareTaskFile(file, { cache, runner: mixed });
+  mixed.limits.max_input_bytes = full.layers.reduce((sum, { descriptor }) => sum + descriptor.size, 0);
+  a[42] ^= 1;
+  await writeFile(join(input, "a.bin"), a);
+  const compacted = await prepareTaskFile(file, { cache, runner: mixed });
+  assert.equal(compacted.layers.length, 3);
+  assert.ok(compacted.layers.every(({ descriptor }) => descriptor.media_type === MEDIA[0]));
+  spec.layers.pop();
+  await writeFile(file, JSON.stringify(spec));
+  await writeFile(join(input, "too-large.bin"), randomBytes(12000));
+  await assert.rejects(prepareTaskFile(file, { runner, cache }), /source.*input.*too-large.bin.*file exceeds the layer limit/);
 });
 
 test("browser preflights permit configured origins without bypassing task authentication", async (t) => {

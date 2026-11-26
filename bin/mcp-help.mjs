@@ -3,6 +3,9 @@ const runnerOptions = `  --profile NAME      Local auth profile. Defaults to SPO
                       or http://127.0.0.1:8787. A profile and URL must agree.
   --workspace PATH    Local project root. Defaults to SPOOL_WORKSPACE_ROOT.
                       Set it to enable Taskfile and layer-building tools.
+  --source-root PATH  Also allow sources recipes to read this directory. Repeat as needed.
+  --allow-source-diff-command
+                      Allow trusted Taskfiles to run their optional local diff command.
   --state-mode MODE   shared (default), isolated (temporary), or custom.
   --state-dir PATH    Custom state root. Providing it selects custom mode
                       unless an explicit mode overrides it.`;
@@ -14,6 +17,7 @@ const help = {
 
 Commands
   serve       Start the stdio MCP server. This is the default.
+  run         Submit a local Taskfile, supply layers, and wait for completion.
   init        Add Spool to a project's MCP configuration.
   capabilities  Query a runner's profiles and limits without MCP setup.
   auth        Sign in, list local credentials, or remove a profile.
@@ -28,6 +32,16 @@ Quick start
   4. Call taskfile_help, then capabilities, submit_template, and wait_task.
 
 Run spool-mcp taskfile for Taskfile syntax and behavior.`,
+  run: `Usage: spool-mcp run PATH [options]
+
+Submit a Taskfile and print terminal status. The workspace defaults to the Taskfile directory.
+
+Options
+${runnerOptions}
+  --request-id ID     Reuse an ID to retry the same compiled manifest.
+
+Example
+  spool-mcp run Taskfile.json --profile NAME --source-root ../shared`,
   serve: `Usage: spool-mcp [serve] [options]
 
 Serve newline-delimited MCP JSON-RPC on stdin/stdout. Usually launched by an MCP host.

@@ -39,7 +39,7 @@ export async function resolveBuild(path, lookup, build, signal) {
     if (prior && await lookup(prior)) return prior;
     signal?.throwIfAborted();
     const descriptor = await build();
-    db.prepare("INSERT OR REPLACE INTO build VALUES (1, ?)").run(JSON.stringify(descriptor));
+    if (descriptor) db.prepare("INSERT OR REPLACE INTO build VALUES (1, ?)").run(JSON.stringify(descriptor));
     return descriptor;
   }, signal);
 }

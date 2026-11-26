@@ -110,6 +110,7 @@ test("CLI and MCP expose Taskfile semantics, schemas, and the same runnable exam
 
   for (const [command, expected] of [
     [["serve"], /MCP JSON-RPC on stdin\/stdout/],
+    [["run"], /--source-root PATH/],
     [["init"], /\.cursor\/mcp\.json/],
     [["auth"], /Profiles bind credentials/],
     [["auth", "login"], /--token-stdin/],

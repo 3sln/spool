@@ -16,7 +16,7 @@ const packageInfo = {
 };
 const clientFiles = [
   "client/index.mjs", "client/build-cache.mjs", "client/cache-leases.mjs", "client/container-build.mjs",
-  "client/layers.mjs", "client/node.mjs", "client/taskfile.mjs", "client/generated/js",
+  "client/layers.mjs", "client/node.mjs", "client/source-diff.mjs", "client/source-layers.mjs", "client/taskfile.mjs", "client/generated/js",
 ];
 const packages = [
   {

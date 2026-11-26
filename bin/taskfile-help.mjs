@@ -31,6 +31,11 @@ base images, features, byte limits, and resource profile.
 - An archive recipe has id, kind "archive", and path to a prepared OCI layer.
   media_type defaults to application/vnd.oci.image.layer.v1.tar. Set
   application/vnd.oci.image.layer.v1.tar+gzip for a gzip layer.
+- A sources recipe declares one or more source mappings. Each has a path
+  relative to its Taskfile, an absolute /workspace destination, and optional
+  include and exclude globs. Each mapping replaces its destination tree.
+  The client builds deterministic archives and reuses cached bases with byte
+  patches for small edits. Git metadata and helper scripts are optional.
 - A docker recipe builds a layer on the client with Docker or Podman. Supply
   a digest-pinned image and argv. The selected input directory is available as
   /inputs.tar. Write the output archive to /build/layer.tar. Each recipe can set
@@ -78,6 +83,10 @@ base images, features, byte limits, and resource profile.
    as cursor to continue. Use task_artifacts and read_artifact for outputs.
    read_artifact reads files up to 512 KiB and supports UTF-8 text.
    Use download_artifact to save larger files under the workspace.
+
+To submit directly, run spool-mcp run Taskfile.json --profile NAME.
+Allow sibling sources with --source-root DIR. Optional local diff commands
+require --allow-source-diff-command. See the README for Git and VCDIFF examples.
 
 Run spool-mcp taskfile example or call taskfile_help with topic "example" for
 the three files of a runnable example. Use topic "schema" for the JSON schemas.

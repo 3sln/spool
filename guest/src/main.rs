@@ -1,4 +1,5 @@
 mod artifacts;
+mod delta;
 mod execute;
 mod workspace;
 

@@ -2,7 +2,7 @@ import { publicEndpoint, taskEndpoint } from "./api.mjs";
 import { INLINE_ARTIFACT_BYTES, LIMITS } from "./contract.mjs";
 import { TaskService } from "./service.mjs";
 
-export { BASE, MEDIA, LIMITS, Fault, configuredLimits, sha256 } from "./contract.mjs";
+export { BASE, MEDIA, PATCH_MEDIA, LIMITS, Fault, configuredLimits, sha256 } from "./contract.mjs";
 export { configuredAuth, jwtVerifier } from "./auth.mjs";
 export { taskEndpoint as dispatchTaskRequest } from "./api.mjs";
 
@@ -23,6 +23,10 @@ function providerLimits(options, transfers, artifacts) {
   const artifactCeiling = artifacts ? ceilings.max_artifact_bytes_total : INLINE_ARTIFACT_BYTES;
   for (const [key, value] of Object.entries(options)) {
     if (key === "uploads") continue;
+    if (key === "patch_layers") {
+      if (typeof value !== "boolean") throw new TypeError("patch_layers must be a boolean");
+      continue;
+    }
     if (!Object.hasOwn(ceilings, key)) throw new TypeError(`Unknown runner limit ${key}`);
     const ceiling = key === "max_artifact_bytes_total" ? artifactCeiling : ceilings[key];
     if (!Number.isSafeInteger(value) || value < (minimumZero.has(key) ? 0 : 1) || value > ceiling) {

@@ -10,7 +10,8 @@ const defaults = {
   cursor: ".cursor/mcp.json",
 };
 const modes = new Set(["shared", "isolated", "custom"]);
-const serveFlags = ["runner", "profile", "workspace", "state-mode", "state-dir"];
+const serveFlags = ["runner", "profile", "workspace", "state-mode", "state-dir", "source-root", "allow-source-diff-command"];
+const booleanFlags = new Set(["force", "dry-run", "token-stdin", "allow-source-diff-command"]);
 const initFlags = [...serveFlags, "client", "scope", "config", "name", "force", "dry-run"];
 
 export function validRunner(value) {
@@ -37,12 +38,18 @@ export function parseCli(args) {
   if (args[0] === "--version") return { command: "version" };
   if (args[0] === "help") return showHelp(isHelp(args[1]) ? "" : args.slice(1).join(" "));
   let topic = "";
-  if (["init", "serve", "capabilities", "cache-gc", "auth", "taskfile"].includes(args[0])) {
+  if (["init", "serve", "run", "capabilities", "cache-gc", "auth", "taskfile"].includes(args[0])) {
     result.command = args.shift();
     topic = result.command;
   }
   if (isHelp(args[0])) return showHelp(topic);
   let allowed = serveFlags;
+  if (result.command === "run") {
+    if (args.some(isHelp)) return showHelp(topic);
+    if (!args[0] || args[0].startsWith("--")) throw new TypeError("Supply the Taskfile path as the first argument to run");
+    result.taskfile = args.shift();
+    allowed = [...serveFlags, "request-id"];
+  }
   if (result.command === "init") allowed = initFlags;
   if (result.command === "capabilities") allowed = ["runner", "profile"];
   if (result.command === "cache-gc") allowed = ["state-dir"];
@@ -68,11 +75,12 @@ export function parseCli(args) {
   while (args.length) {
     const flag = args.shift();
     const key = flag.startsWith("--") ? flag.slice(2) : "";
-    if (!allowed.includes(key) || Object.hasOwn(result, key)) throw new TypeError(`Unexpected or repeated option: ${flag}`);
-    if (["force", "dry-run", "token-stdin"].includes(key)) result[key] = true;
+    if (!allowed.includes(key) || (key !== "source-root" && Object.hasOwn(result, key))) throw new TypeError(`Unexpected or repeated option: ${flag}`);
+    if (booleanFlags.has(key)) result[key] = true;
     else {
       if (!args[0] || args[0].startsWith("--")) throw new TypeError(`Option ${flag} requires a value`);
-      result[key] = args.shift();
+      if (key === "source-root") (result[key] ??= []).push(args.shift());
+      else result[key] = args.shift();
     }
   }
   result.runner = validRunner(result.runner);
@@ -102,7 +110,12 @@ export async function cliState(options, env) {
 
 function configEntry(options) {
   const args = ["serve"];
-  for (const option of serveFlags) if (options[option] !== undefined) args.push(`--${option}`, options[option]);
+  for (const key of serveFlags) {
+    if (options[key] === undefined) continue;
+    if (key === "source-root") for (const path of options[key]) args.push("--source-root", resolve(path));
+    else if (booleanFlags.has(key)) args.push(`--${key}`);
+    else args.push(`--${key}`, options[key]);
+  }
   return { command: "spool-mcp", args };
 }
 

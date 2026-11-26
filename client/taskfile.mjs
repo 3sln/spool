@@ -1,10 +1,12 @@
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { buildKey, directorySelection, planDirectoryLayer } from "./node.mjs";
-import { buildLayer, TAR, TAR_GZIP } from "./layers.mjs";
+import { buildLayer, PATCH_MEDIA, TAR, TAR_GZIP } from "./layers.mjs";
 import { buildContainerLayer } from "./container-build.mjs";
+import { planSourceLayers } from "./source-layers.mjs";
 
 const maxTemplateBytes = 128 * 1024;
+class SourcePatchBudget extends RangeError {}
 const map = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const string = (value) => typeof value === "string" && value.length > 0 && value.isWellFormed() && !value.includes("\0");
 const name = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
@@ -146,6 +148,7 @@ async function builtinLayer(recipe, context) {
 
 export async function prepareTaskFile(file, {
   contextRoot = dirname(resolve(file)), runner, client, cache, layerBuilders = {}, buildEngines, requestId = crypto.randomUUID(), signal,
+  sourceRoots = [], allowSourceDiffCommand = false,
 } = {}) {
   if (!cache || typeof cache.put !== "function") throw new TypeError("A writable layer cache is required");
   if (!string(requestId) || !/^[A-Za-z0-9._:-]{1,128}$/u.test(requestId)) throw new TypeError("Invalid task request ID");
@@ -235,79 +238,130 @@ export async function prepareTaskFile(file, {
   }
   if (resources.timeout_s !== undefined && (!Number.isSafeInteger(resources.timeout_s) || resources.timeout_s < 1
     || resources.timeout_s > (limits.max_job_seconds ?? Infinity))) throw new Error("Command timeout is outside the runner limits");
-  if (recipes.size > (limits.max_layers ?? 16)) throw new RangeError("Taskfile contains too many layers");
-  const evaluated = [];
-  const layerSources = {};
-  let total = 0;
+  const maxLayers = limits.max_layers ?? 16;
+  const maxInputBytes = limits.max_input_bytes ?? Infinity;
+  if (recipes.size > maxLayers) throw new RangeError("Taskfile contains too many layers");
   const maxBytes = limits.max_layer_bytes ?? 4 * 1024 ** 2;
-  function addLayer(id, descriptor) {
-    total += descriptor.size;
-    evaluated.push({ id, descriptor });
+  const sourcePlans = new Map();
+  const sourceBudget = { slots: maxLayers - recipes.size, bytes: maxInputBytes };
+  if ([...recipes.values()].some(({ recipe }) => recipe.kind === "sources")) {
+    if (!Array.isArray(sourceRoots)) throw new TypeError("sourceRoots must be an array of allowed directories");
+    const roots = [root, ...await Promise.all(sourceRoots.map((path) => realpath(path)))];
+    for (const [id, { recipe, directory }] of recipes) {
+      if (recipe.kind !== "sources") continue;
+      fields(recipe, ["id", "kind", "sources", "diff"], "sources layer");
+      const plan = await planSourceLayers(recipe, {
+        directory, roots, maxLayers, maxBytes, maxInputBytes, cache, signal, allowSourceDiffCommand: allowSourceDiffCommand === true,
+      });
+      sourcePlans.set(id, plan);
+      sourceBudget.slots -= plan.count - 1;
+      sourceBudget.bytes -= plan.bytes;
+      if (sourceBudget.slots < 0 || sourceBudget.bytes < 0) throw new RangeError(`Layer "${id}" exceeds the task's layer count or combined input budget after splitting`);
+    }
   }
-  for (const [id, { recipe, directory }] of recipes) {
-    signal?.throwIfAborted();
-    const validate = (size, mediaType) => {
-      if (!Number.isSafeInteger(size) || size < 1 || size > maxBytes || total + size > (limits.max_input_bytes ?? Infinity)) {
-        throw new RangeError("Layers exceed the runner byte limits");
+  async function compile(allowPatches) {
+    const evaluated = [];
+    const layerSources = {};
+    const extra = { ...sourceBudget };
+    let total = 0;
+    let expandedTarBytes = 0;
+    let selectedPatch = false;
+    function addLayer(id, descriptor) {
+      total += descriptor.size;
+      evaluated.push({ id, descriptor });
+    }
+    for (const [id, { recipe, directory }] of recipes) {
+      signal?.throwIfAborted();
+      const validate = (size, mediaType) => {
+        if (!Number.isSafeInteger(size) || size < 1 || size > maxBytes) {
+          throw new RangeError("Layers exceed the runner byte limits");
+        }
+        if (total + size > maxInputBytes) {
+          if (selectedPatch) throw new SourcePatchBudget("Source patches exceed the remaining input budget");
+          throw new RangeError("Combined layers exceed the runner byte limit");
+        }
+        if (!discovery.layer_media_types?.includes(mediaType)) throw new Error(`Runner does not support layer media type ${mediaType}`);
+      };
+      if (recipe.kind === "sources") {
+        const plan = sourcePlans.get(id);
+        const workspaceBytes = Math.floor(Math.max(resources.disk_mib, required.resources.disk_mib ?? 0) * 1024 ** 2 * 3 / 4);
+        const descriptors = await plan.select(extra, {
+          patches: allowPatches && discovery.layer_media_types?.includes(PATCH_MEDIA), workspaceBytes: workspaceBytes - expandedTarBytes,
+        });
+        expandedTarBytes += plan.bytes;
+        for (const descriptor of descriptors) {
+          selectedPatch ||= descriptor.media_type === PATCH_MEDIA;
+          validate(descriptor.size, descriptor.media_type);
+          addLayer(id, descriptor);
+        }
+        continue;
       }
-      if (!discovery.layer_media_types?.includes(mediaType)) throw new Error(`Runner does not support layer media type ${mediaType}`);
-    };
-    if (recipe.kind === "artifact") {
-      fields(recipe, ["id", "kind", "task_id", "path", "media_type"], "artifact layer");
-      if (!client || !discovery.features?.includes("artifact-layer-source")) throw new Error("Artifact layers need a client and a supporting runner");
-      if (!/^[0-9a-f-]{36}$/u.test(recipe.task_id) || !workspacePath(recipe.path) || recipe.path === "/workspace") {
-        throw new TypeError("An artifact layer requires a producer task ID and an absolute workspace artifact path");
+      if (recipe.kind === "artifact") {
+        fields(recipe, ["id", "kind", "task_id", "path", "media_type"], "artifact layer");
+        if (!client || !discovery.features?.includes("artifact-layer-source")) throw new Error("Artifact layers need a client and a supporting runner");
+        if (!/^[0-9a-f-]{36}$/u.test(recipe.task_id) || !workspacePath(recipe.path) || recipe.path === "/workspace") {
+          throw new TypeError("An artifact layer requires a producer task ID and an absolute workspace artifact path");
+        }
+        const media_type = recipe.media_type ?? TAR;
+        if (![TAR, TAR_GZIP].includes(media_type)) throw new TypeError("Expected an OCI tar media type");
+        const { artifacts } = await client.artifacts(recipe.task_id, { signal });
+        const artifact = artifacts.find(({ path }) => path === recipe.path);
+        if (!artifact || !/^sha256:[a-f0-9]{64}$/u.test(artifact.digest)) throw new Error(`No artifact at ${recipe.path}`);
+        validate(artifact.size, media_type);
+        extra.bytes -= artifact.size;
+        if (media_type === TAR) expandedTarBytes += artifact.size;
+        const descriptor = { digest: artifact.digest, size: artifact.size, media_type };
+        layerSources[descriptor.digest] = { task_id: recipe.task_id, path: recipe.path };
+        addLayer(id, descriptor);
+        continue;
       }
-      const media_type = recipe.media_type ?? TAR;
-      if (![TAR, TAR_GZIP].includes(media_type)) throw new TypeError("Expected an OCI tar media type");
-      const { artifacts } = await client.artifacts(recipe.task_id, { signal });
-      const artifact = artifacts.find(({ path }) => path === recipe.path);
-      if (!artifact || !/^sha256:[a-f0-9]{64}$/u.test(artifact.digest)) throw new Error(`No artifact at ${recipe.path}`);
-      validate(artifact.size, media_type);
-      const descriptor = { digest: artifact.digest, size: artifact.size, media_type };
-      layerSources[descriptor.digest] = { task_id: recipe.task_id, path: recipe.path };
+      const plugin = Object.hasOwn(layerBuilders, recipe.kind) ? layerBuilders[recipe.kind] : undefined;
+      const buildResources = {};
+      if (recipe.build_resources !== undefined) mergeMinimums(buildResources, recipe.build_resources, "build_resources");
+      const context = { root, directory, maxBytes, signal, cache, buildResources, buildEngines };
+      const parents = evaluated.map(({ descriptor }) => ({ ...descriptor }));
+      const buildContext = {
+        ...selected, parents, runner: discovery, signal, maxBytes, buildResources,
+        resolvePath: (path) => scopedPath(root, directory, path),
+      };
+      const plan = await builtinLayer(recipe, context)
+        ?? (typeof plugin === "function" ? { build: () => plugin(recipe, buildContext) }
+          : plugin && string(plugin.version) && typeof plugin.fingerprint === "function" && typeof plugin.build === "function"
+            ? { version: plugin.version, fingerprint: () => plugin.fingerprint(recipe, buildContext),
+              build: () => plugin.build(recipe, buildContext) }
+            : undefined);
+      if (!plan) throw new Error(`Unsupported layer recipe: ${recipe.kind}`);
+      const build = async () => {
+        const result = await plan.build();
+        if (!result || !(result.bytes instanceof Uint8Array) || !result.bytes.length) throw new Error(`Empty layer recipe: ${recipe.kind}`);
+        validate(result.bytes.length, result.mediaType);
+        return result;
+      };
+      let descriptor;
+      if (plan.fingerprint && (plan.import ? typeof cache.resolveBuildDescriptor === "function" : typeof cache.resolveBuild === "function")) {
+        const inputs = await plan.fingerprint();
+        if (!string(inputs)) throw new Error(`Layer fingerprint must be a nonempty string: ${recipe.kind}`);
+        const key = buildKey(["taskfile-layer", 1, recipe.kind, plan.version, selected.platform.os, selected.platform.arch,
+          selected.base.id, selected.base.digest, parents.map((layer) => [layer.digest, layer.size, layer.media_type]), inputs]);
+        descriptor = plan.import ? await cache.resolveBuildDescriptor(key, plan.import, { signal })
+          : await cache.resolveBuild(key, build, { signal });
+      } else if (plan.import) {
+        descriptor = await plan.import();
+      } else {
+        const result = await build();
+        descriptor = await cache.put(result.bytes, result.mediaType);
+      }
+      validate(descriptor.size, descriptor.media_type);
+      extra.bytes -= descriptor.size;
+      if (descriptor.media_type === TAR) expandedTarBytes += descriptor.size;
       addLayer(id, descriptor);
-      continue;
     }
-    const plugin = Object.hasOwn(layerBuilders, recipe.kind) ? layerBuilders[recipe.kind] : undefined;
-    const buildResources = {};
-    if (recipe.build_resources !== undefined) mergeMinimums(buildResources, recipe.build_resources, "build_resources");
-    const context = { root, directory, maxBytes, signal, cache, buildResources, buildEngines };
-    const parents = evaluated.map(({ descriptor }) => ({ ...descriptor }));
-    const buildContext = {
-      ...selected, parents, runner: discovery, signal, maxBytes, buildResources,
-      resolvePath: (path) => scopedPath(root, directory, path),
-    };
-    const plan = await builtinLayer(recipe, context)
-      ?? (typeof plugin === "function" ? { build: () => plugin(recipe, buildContext) }
-        : plugin && string(plugin.version) && typeof plugin.fingerprint === "function" && typeof plugin.build === "function"
-          ? { version: plugin.version, fingerprint: () => plugin.fingerprint(recipe, buildContext),
-            build: () => plugin.build(recipe, buildContext) }
-          : undefined);
-    if (!plan) throw new Error(`Unsupported layer recipe: ${recipe.kind}`);
-    const build = async () => {
-      const result = await plan.build();
-      if (!result || !(result.bytes instanceof Uint8Array) || !result.bytes.length) throw new Error(`Empty layer recipe: ${recipe.kind}`);
-      validate(result.bytes.length, result.mediaType);
-      return result;
-    };
-    let descriptor;
-    if (plan.fingerprint && (plan.import ? typeof cache.resolveBuildDescriptor === "function" : typeof cache.resolveBuild === "function")) {
-      const inputs = await plan.fingerprint();
-      if (!string(inputs)) throw new Error(`Layer fingerprint must be a nonempty string: ${recipe.kind}`);
-      const key = buildKey(["taskfile-layer", 1, recipe.kind, plan.version, selected.platform.os, selected.platform.arch,
-        selected.base.id, selected.base.digest, parents.map((layer) => [layer.digest, layer.size, layer.media_type]), inputs]);
-      descriptor = plan.import ? await cache.resolveBuildDescriptor(key, plan.import, { signal })
-        : await cache.resolveBuild(key, build, { signal });
-    } else if (plan.import) {
-      descriptor = await plan.import();
-    } else {
-      const result = await build();
-      descriptor = await cache.put(result.bytes, result.mediaType);
-    }
-    validate(descriptor.size, descriptor.media_type);
-    addLayer(id, descriptor);
+    return { evaluated, layerSources };
   }
+  const { evaluated, layerSources } = await compile(true).catch((error) => {
+    if (error instanceof SourcePatchBudget) return compile(false);
+    throw error;
+  });
   const manifest = {
     protocol_version: "0.1", client_request_id: requestId, task_timeout_s: taskTimeout, platform: selected.platform,
     environment: { base: selected.base, layers: evaluated.map(({ descriptor }) => descriptor) },

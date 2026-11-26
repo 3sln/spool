@@ -63,6 +63,8 @@ With an artifact provider and a layer provider that implements `putVerified`, th
 
 An artifact provider can implement `presignDownload(key, expiresAtMs)` to issue a short-lived HTTPS GET URL for the verified object. Return `undefined` when the artifact needs an authenticated gateway download.
 
+Set `limits.patch_layers: true` if your executor implements the [VCDIFF workspace layer profile](README.md#source-archive-patches). The stock Docker and Workers adapters enable it with the current native guest.
+
 Gateway PUT is the default. A transfer provider defaults to advertising
 `presigned-put` and `presigned-multipart`. Set `limits.uploads` for a subset or
 to offer gateway PUT alongside them.

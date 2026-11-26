@@ -8,11 +8,49 @@ import { pipeline } from "node:stream/promises";
 import manifestSchema from "../protocol/manifest.schema.json" with { type: "json" };
 import { createClient } from "../client/index.mjs";
 import { directorySelection, openLayerCache } from "../client/node.mjs";
-import { prepareTaskFile } from "../client/taskfile.mjs";
+import { prepareTaskFile, runTaskFile } from "../client/taskfile.mjs";
 import pkg from "../package.json" with { type: "json" };
 import { cliState, initializeCli, parseCli } from "./mcp-config.mjs";
 import { authCommand, runnerConnection } from "./mcp-auth.mjs";
 import { taskfileHelp, taskfileResources, taskfileTopics } from "./taskfile-help.mjs";
+
+const sourceOptions = (options) => ({
+  sourceRoots: options["source-root"], allowSourceDiffCommand: options["allow-source-diff-command"],
+});
+
+async function runnerClient(options, env, cache) {
+  return createClient({
+    ...await runnerConnection(options, env),
+    allowTransferURL: (url) => (env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((item) => item.trim()).includes(url.origin),
+    layerSource: cache.open,
+  });
+}
+
+async function run(options, env) {
+  const file = resolve(options.taskfile);
+  const workspace = options.workspace ?? env.SPOOL_WORKSPACE_ROOT ?? dirname(file);
+  const state = await cliState(options, env);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  process.once("SIGINT", abort);
+  process.once("SIGTERM", abort);
+  try {
+    const cache = await openLayerCache(state.blobs, { workspace,
+      leaseTtlMs: env.SPOOL_CACHE_LEASE_SECONDS === undefined ? undefined : Number(env.SPOOL_CACHE_LEASE_SECONDS) * 1000,
+    });
+    const client = await runnerClient(options, env, cache);
+    const { task } = await runTaskFile(file, {
+      client, cache, contextRoot: workspace, ...sourceOptions(options), requestId: options["request-id"],
+      signal: controller.signal, onAccepted: ({ task_id }) => console.error(`Spool accepted task ${task_id}`),
+    });
+    console.log(JSON.stringify(task, null, 2));
+    if (task.state !== "SUCCEEDED") process.exitCode = 1;
+  } finally {
+    process.off("SIGINT", abort);
+    process.off("SIGTERM", abort);
+    await state.close();
+  }
+}
 
 async function serve(options, env) {
   const state = await cliState(options, env);
@@ -29,11 +67,7 @@ async function serve(options, env) {
     const workspace = workspacePathOption && await realpath(workspacePathOption);
     const leaseTtlMs = env.SPOOL_CACHE_LEASE_SECONDS === undefined ? undefined : Number(env.SPOOL_CACHE_LEASE_SECONDS) * 1000;
     cache = await openLayerCache(state.blobs, { workspace: workspace || undefined, leaseTtlMs });
-    const client = createClient({
-      ...await runnerConnection(options, env),
-      allowTransferURL: (url) => (env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((item) => item.trim()).includes(url.origin),
-      layerSource: cache.open,
-    });
+    const client = await runnerClient(options, env, cache);
 
     async function workspacePath(path) {
       if (!workspace || typeof path !== "string" || isAbsolute(path) || path.split(/[\\/]/u).includes("..")) {
@@ -81,7 +115,9 @@ async function serve(options, env) {
         const file = await workspacePath(path);
         const runner = shards === undefined ? undefined : await client.capabilities({ signal });
         if (runner && !runner.features?.includes("task-shards")) throw new Error("Runner does not offer task shards");
-        const { manifest } = await prepareTaskFile(file, { contextRoot: workspace, client, runner, cache, requestId: client_request_id, signal });
+        const { manifest } = await prepareTaskFile(file, {
+          contextRoot: workspace, client, runner, cache, requestId: client_request_id, signal, ...sourceOptions(options),
+        });
         if (shards === undefined) return client.submit(manifest, { signal });
         const tasks = [];
         for (let index = 0; index < shards; index++) {
@@ -317,6 +353,7 @@ try {
       break;
     }
     case "version": console.log(pkg.version); break;
+    case "run": await run(options, process.env); break;
     case "init": {
       const result = await initializeCli(options);
       console.log(JSON.stringify(result, null, 2));

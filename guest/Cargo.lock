@@ -310,6 +310,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tiny_http",
+ "vcdiff-common",
 ]
 
 [[package]]
@@ -370,6 +371,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "vcdiff-common"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2699b93a351fb0fd22c5ddd616d4ce3e7cc92af526934818be1034019f0d7d1"
 
 [[package]]
 name = "windows-link"

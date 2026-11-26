@@ -1,4 +1,4 @@
-use crate::{Layer, Work};
+use crate::{Layer, Work, delta};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use flate2::read::MultiGzDecoder;
 use sha2::{Digest, Sha256};
@@ -272,25 +272,35 @@ fn apply(
     disk_left: &mut u64,
     entries: &mut usize,
 ) -> io::Result<()> {
+    verified(layer, input, |input| {
+        let stream: Box<dyn Read> = match layer.media_type.as_str() {
+            TAR => Box::new(input),
+            "application/vnd.oci.image.layer.v1.tar+gzip" => Box::new(MultiGzDecoder::new(input)),
+            _ => return Err(invalid("unsupported archive format")),
+        };
+        let budget = disk_left.saturating_add(1);
+        let mut bounded = stream.take(budget);
+        extract_layer(root, &mut bounded, entries)?;
+        io::copy(&mut bounded, &mut io::sink())?;
+        let consumed = budget - bounded.limit();
+        if consumed > *disk_left {
+            return Err(invalid("expanded layers exceed the workspace budget"));
+        }
+        *disk_left -= consumed;
+        Ok(())
+    })
+}
+
+fn verified<T>(
+    layer: &Layer,
+    input: impl Read,
+    consume: impl FnOnce(&mut dyn Read) -> io::Result<T>,
+) -> io::Result<T> {
     let mut input = Verify {
         input: input.take(layer.size as u64),
         digest: Sha256::new(),
     };
-    let stream: Box<dyn Read> = match layer.media_type.as_str() {
-        TAR => Box::new(&mut input),
-        "application/vnd.oci.image.layer.v1.tar+gzip" => Box::new(MultiGzDecoder::new(&mut input)),
-        _ => return Err(invalid("unsupported archive format")),
-    };
-    let budget = disk_left.saturating_add(1);
-    let mut bounded = stream.take(budget);
-    extract_layer(root, &mut bounded, entries)?;
-    io::copy(&mut bounded, &mut io::sink())?;
-    let consumed = budget - bounded.limit();
-    drop(bounded);
-    if consumed > *disk_left {
-        return Err(invalid("expanded layers exceed the workspace budget"));
-    }
-    *disk_left -= consumed;
+    let result = consume(&mut input)?;
     let digest: String = input
         .digest
         .finalize()
@@ -300,7 +310,7 @@ fn apply(
     if input.input.limit() != 0 || layer.digest.strip_prefix("sha256:") != Some(digest.as_str()) {
         return Err(invalid("layer length or digest mismatch"));
     }
-    Ok(())
+    Ok(result)
 }
 
 pub struct AssemblyError {
@@ -332,10 +342,49 @@ pub fn assemble(
     // Leave space for workspace outputs. The provider separately bounds the filesystem.
     let mut bytes_left = u64::from(work.manifest.resources.disk_mib) * 1024 * 1024 * 3 / 4;
     let mut entries_left = MAX_ENTRIES;
+    let mut base = None;
     for (index, layer) in layers.iter().enumerate() {
+        let mut consume = |input: &mut dyn Read| -> io::Result<()> {
+            if layer.media_type == delta::MEDIA {
+                let dictionary = base
+                    .take()
+                    .ok_or_else(|| invalid("VCDIFF layer has no tar base"))?;
+                let (archive, size, digest) = verified(layer, input, |patch| {
+                    delta::apply(root, dictionary, patch, layer.size as u64, bytes_left)
+                })?;
+                if layers
+                    .get(index + 1)
+                    .is_some_and(|next| next.media_type == delta::MEDIA)
+                {
+                    base = Some(archive);
+                    return Ok(());
+                }
+                let rebuilt = Layer {
+                    size: size as usize,
+                    digest,
+                    media_type: TAR.to_owned(),
+                };
+                apply(root, &rebuilt, archive, &mut bytes_left, &mut entries_left)
+            } else if layers
+                .get(index + 1)
+                .is_some_and(|next| next.media_type == delta::MEDIA)
+            {
+                if layer.media_type != TAR || layer.size as u64 > bytes_left {
+                    return Err(invalid(
+                        "VCDIFF base must be a tar within the workspace input budget",
+                    ));
+                }
+                let mut archive = tempfile::tempfile_in(root)?;
+                verified(layer, input, |reader| io::copy(reader, &mut archive))?;
+                base = Some(archive);
+                Ok(())
+            } else {
+                apply(root, layer, input, &mut bytes_left, &mut entries_left)
+            }
+        };
         let assembled = (|| {
             if let Some(input) = stream.as_deref_mut() {
-                apply(root, layer, input, &mut bytes_left, &mut entries_left)
+                consume(input)
             } else {
                 let bytes = STANDARD
                     .decode(&work.layers[index])
@@ -343,7 +392,7 @@ pub fn assemble(
                 if bytes.len() != layer.size {
                     return Err(invalid("invalid layer size"));
                 }
-                apply(root, layer, &bytes[..], &mut bytes_left, &mut entries_left)
+                consume(&mut &bytes[..])
             }
         })();
         assembled.map_err(|error| AssemblyError {

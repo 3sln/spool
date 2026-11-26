@@ -4,8 +4,8 @@ import { lstat, mkdir, open, readdir, readlink, realpath, rename, rm } from "nod
 import { resolve, join, posix } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { buildLayer, DEFAULT_LAYER_LIMIT, layerDescriptor, TAR, TAR_GZIP } from "./layers.mjs";
-import { resolveBuild } from "./build-cache.mjs";
+import { buildLayer, DEFAULT_LAYER_LIMIT, layerDescriptor, PATCH_MEDIA, TAR, TAR_GZIP } from "./layers.mjs";
+import { resolveBuild, withCacheTransaction } from "./build-cache.mjs";
 import { leaseDirectory, leaseIndex } from "./cache-leases.mjs";
 
 function keyFor(digest) {
@@ -152,7 +152,7 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
         }
       },
       async importFile(path, mediaType = TAR, { maxBytes = maxLayerBytes, signal } = {}) {
-        if (![TAR, TAR_GZIP].includes(mediaType)) throw new TypeError("Expected an OCI tar media type");
+        if (![TAR, TAR_GZIP, PATCH_MEDIA].includes(mediaType)) throw new TypeError("Expected a supported layer media type");
         const entry = await openRegular(path, Math.min(maxBytes, maxLayerBytes));
         const temporary = join(root, `.${crypto.randomUUID()}.tmp`);
         try {
@@ -178,6 +178,17 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
         await mkdir(index, { recursive: true, mode: 0o700 });
         return resolveBuild(join(index, key + ".sqlite"),
           (descriptor) => cache.open(descriptor, { signal }), build, signal);
+      },
+      async updateSourceBaseline(key, update, { signal } = {}) {
+        const index = join(root, ".sources");
+        await mkdir(index, { recursive: true, mode: 0o700 });
+        return withCacheTransaction(join(index, keyFor(key) + ".sqlite"), async (db) => {
+          db.exec("CREATE TABLE IF NOT EXISTS baseline (slot INTEGER PRIMARY KEY, descriptors TEXT NOT NULL)");
+          const row = db.prepare("SELECT descriptors FROM baseline WHERE slot = 1").get();
+          const { baseline, layers } = await update(row ? JSON.parse(row.descriptors) : []);
+          db.prepare("INSERT OR REPLACE INTO baseline VALUES (1, ?)").run(JSON.stringify(baseline));
+          return layers;
+        }, signal);
       },
       async buildDirectory(directory, options = {}) {
         const prepared = await planDirectoryLayer(directory, options);

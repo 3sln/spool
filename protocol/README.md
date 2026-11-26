@@ -46,6 +46,12 @@ All transfer requests have the content length declared by their plan. Presigned 
 
 The cache is scoped to the tenant and can be evicted. The executor verifies the archived bytes again as they enter the offline guest. Cache retention is advisory and independent of the upload and task deadlines. Missing layers at the admission deadline yield `LAYER_UNAVAILABLE`.
 
+### Source archive patches
+
+Runners that advertise `application/vnd.spool.workspace.patch.v1+vcdiff` accept an uncompressed tar descriptor followed immediately by one or more patch descriptors. The guest reconstructs each patch using the preceding archive as its dictionary and extracts the final archive once. Wire descriptors still describe the exact transferred bytes, and all members of the chain count toward the runner's transfer limits.
+
+Each patch starts with the target tar's byte length as an unsigned 64-bit big-endian integer, followed by its raw 32-byte SHA-256 and the VCDIFF program. The guest accepts the RFC 3284 default code table with no optional header fields, checksum extensions, secondary compression, or references to previous target windows. Source and target windows are limited to 16 MiB each. It bounds reconstruction by the workspace input budget and verifies the target length and digest before extraction. [RFC 3284](https://www.rfc-editor.org/rfc/rfc3284)
+
 ## Artifacts
 
 The runner collects declared regular files from the final workspace within the combined `limits.max_artifact_bytes_total` budget. An output that is absent or exceeds the remaining budget is omitted. Artifact listings include the path, byte size, SHA-256, authenticated download URL and expiry. Downloads are raw byte streams with a `Content-Length` header. They require the owning principal and expire with task history. The stock Workers runner stores outputs in R2. The stock Node runner stores them on disk or in its configured S3 bucket.

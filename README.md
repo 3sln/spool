@@ -149,6 +149,50 @@ The runner returns any missing digests and an upload plan for each. The client r
 
 Paths resolve relative to the file declaring them and stay inside the caller's context root. Directory recipes accept a `previous` snapshot and optional `include` and `exclude` lists of paths or globs relative to the layer directory. For example, `"include": ["src", "docs/**/*.json"], "exclude": ["**/fixtures", ".git"]` selects source and JSON input files. A matched directory includes or excludes its subtree. The same filters apply to both sides of a delta. Archive recipes import prebuilt OCI bytes.
 
+### Source trees and incremental patches
+
+Use a `sources` layer to map local directories to their guest destinations. Paths resolve relative to the Taskfile that declares each mapping. Include and exclude patterns are relative to that source directory. A mapping owns its destination subtree and replaces any earlier contents there. Destinations within one recipe must be disjoint. Use a destination such as `/workspace/app` to preserve earlier files elsewhere in the workspace.
+
+```json
+{
+  "version": "0.1",
+  "kind": "task",
+  "task_timeout_s": 600,
+  "layers": [
+    {
+      "id": "sources",
+      "kind": "sources",
+      "sources": [
+        { "path": ".", "destination": "/workspace/app", "exclude": [".git", "target", "node_modules"] },
+        { "path": "../shared", "destination": "/workspace/shared", "exclude": [".git"] }
+      ]
+    }
+  ],
+  "command": { "argv": ["sh", "check.sh"], "cwd": "/workspace/app" }
+}
+```
+
+Run `spool-mcp run Taskfile.json --profile NAME --source-root ../shared` or pass the same source root to `spool-mcp init` for MCP. Repeat `--source-root` for more directories outside the project. SDK callers pass `sourceRoots` to `prepareTaskFile` or `runTaskFile`.
+
+The client snapshots included files, executable bits, empty directories, and workspace-contained relative symlinks. The first submit builds deterministic uncompressed archives. Small edits produce byte patches against the previous snapshot, including edits inside binary files. The runner reconstructs the current archive before extraction, which also handles deletions. Patches reuse cached bases and earlier patches until the chain grows too large for the size or layer budget. The client then makes a fresh base. A runner can ask for an older base again after eviction. Fresh bases match across checkouts with the same normalized content, mapping and packing limits. Clients with different cache histories may use different patch chains to produce the same workspace.
+
+Large trees split between archive entries. One file still needs to fit in a single base archive, and all archives and patches count toward the runner's layer and transfer limits. Runners with the older media profile receive full archives.
+
+The built-in encoder works with Git checkouts and ordinary directories. Omit `diff` for the usual workflow. To use a custom command, start the CLI or MCP adapter with `--allow-source-diff-command` or set `allowSourceDiffCommand` in the SDK. These commands run locally with the client's user permissions.
+
+```json
+"diff": {
+  "format": "git",
+  "argv": ["git", "diff", "--no-index", "--binary", "--", "{base}", "{current}"]
+}
+```
+
+For `git`, Spool passes two staged directory names. The command emits a Git patch on stdout and can exit with status 1 when differences exist. Spool applies it to scratch files, verifies file bytes, symlink targets and executable bits against the target, and encodes the result for the guest. The default `strip` count of 2 matches the example. Directory entries come from the source snapshot. `git diff HEAD` compares with a Git commit, while the staged directories represent the exact snapshots for this run.
+
+For `vcdiff`, the placeholders `{base}` and `{current}` refer to uncompressed tar files. The command writes the RFC 3284 delta to `{patch}`. For example, use `["xdelta3", "-e", "-A", "-n", "-S", "none", "-B", "8388608", "-W", "1048576", "-s", "{base}", "{current}", "{patch}"]`. [Supported VCDIFF wire profile](protocol/README.md#source-archive-patches)
+
+### Layer build reuse
+
 Keep large stable inputs in lower layers and frequently edited scripts or patches in upper layers. The client fingerprints directory content and indexes each built layer by the recipe version, platform, base, ordered parent digests, and normalized inputs. Separate projects with the same prefix and local cache share one build, even when their checkout paths or layer IDs differ. A per-key SQLite lock coordinates the processes and releases when a builder exits. The actual archive SHA-256 stays in the manifest for uploads and verification.
 
 ### Prepare Linux binaries and reuse build outputs

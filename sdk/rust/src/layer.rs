@@ -11,6 +11,7 @@ use std::{
 
 pub const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 pub const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+pub const PATCH_MEDIA: &str = "application/vnd.spool.workspace.patch.v1+vcdiff";
 const MAX: usize = 4 * 1024 * 1024;
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
@@ -33,8 +34,8 @@ pub fn describe_reader(
     media_type: &str,
     maximum: usize,
 ) -> Result<Descriptor> {
-    if !matches!(media_type, TAR | TAR_GZIP) {
-        return Err(Error::Invalid("Expected an OCI tar media type"));
+    if !matches!(media_type, TAR | TAR_GZIP | PATCH_MEDIA) {
+        return Err(Error::Invalid("Expected a supported layer media type"));
     }
     let mut hasher = Sha256::new();
     let mut buffer = [0; 64 * 1024];
@@ -61,9 +62,9 @@ pub fn describe_reader(
 }
 
 pub fn describe(bytes: &[u8], media_type: &str) -> Result<Descriptor> {
-    if bytes.is_empty() || !matches!(media_type, TAR | TAR_GZIP) {
+    if bytes.is_empty() || !matches!(media_type, TAR | TAR_GZIP | PATCH_MEDIA) {
         return Err(Error::Invalid(
-            "Expected nonempty bytes and an OCI tar media type",
+            "Expected nonempty bytes and a supported layer media type",
         ));
     }
     Ok(Descriptor {

@@ -2,10 +2,11 @@ const encoder = new TextEncoder();
 
 export const TAR = "application/vnd.oci.image.layer.v1.tar";
 export const TAR_GZIP = `${TAR}+gzip`;
+export const PATCH_MEDIA = "application/vnd.spool.workspace.patch.v1+vcdiff";
 export const DEFAULT_LAYER_LIMIT = 4 * 1024 ** 2;
 
 export async function layerDescriptor(bytes, media_type = TAR) {
-  if (!(bytes instanceof Uint8Array) || !bytes.length || ![TAR, TAR_GZIP].includes(media_type)) {
+  if (!(bytes instanceof Uint8Array) || !bytes.length || ![TAR, TAR_GZIP, PATCH_MEDIA].includes(media_type)) {
     throw new TypeError("Expected nonempty OCI layer bytes and a supported media type");
   }
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
@@ -59,43 +60,45 @@ function headerFor(path, kind, size, executable, target) {
   return header;
 }
 
+export function tarMember({ kind, path, size = 0, executable, target }) {
+  if (!["directory", "file", "symlink", "delete", "opaque"].includes(kind)) throw new TypeError("Unknown layer entry kind");
+  const name = kind === "delete" || kind === "opaque" ? whiteout(path, kind === "opaque") : parts(path).join("/");
+  if (kind === "symlink") {
+    let depth = name.split("/").length - 1;
+    let descending = false;
+    if (typeof target !== "string" || !target || target.startsWith("/") || !target.isWellFormed() || target.includes("\0")
+      || target.split("/").some((part) => {
+        if (part === "..") return descending || --depth < 0;
+        if (part && part !== ".") descending = true;
+        return false;
+      })) throw new TypeError(`Symlink target must stay inside the workspace with parent segments before named segments: ${name}`);
+    if (encoder.encode(target).length > 100) throw new RangeError(`Symlink target exceeds the USTAR field limit: ${name}`);
+  }
+  const padding = (512 - size % 512) % 512;
+  return { name, header: headerFor(name, kind, size, executable, target), padding, bytes: 512 + size + padding };
+}
+
 // Build a deterministic workspace changeset from bytes or explicit whiteout entries.
 export function buildLayer(entries, { maxBytes = DEFAULT_LAYER_LIMIT } = {}) {
   const prepared = new Map();
   let length = 1024;
   for (const entry of entries) {
-    if (!["directory", "file", "symlink", "delete", "opaque"].includes(entry.kind)) throw new TypeError("Unknown layer entry kind");
-    const marker = entry.kind === "delete" || entry.kind === "opaque";
-    const path = marker ? whiteout(entry.path, entry.kind === "opaque") : parts(entry.path).join("/");
-    if (prepared.has(path)) throw new TypeError(`Duplicate layer path: ${path}`);
     const data = entry.kind === "file" ? entry.bytes : new Uint8Array();
-    const target = entry.kind === "symlink" ? entry.target : undefined;
-    if (entry.kind === "symlink") {
-      let depth = path.split("/").length - 1;
-      let descending = false;
-      if (typeof target !== "string" || !target || target.startsWith("/") || !target.isWellFormed() || target.includes("\0")
-        || target.split("/").some((part) => {
-          if (part === "..") return descending || --depth < 0;
-          if (part && part !== ".") descending = true;
-          return false;
-        })) throw new TypeError(`Symlink target must stay inside the workspace with parent segments before named segments: ${path}`);
-      if (encoder.encode(target).length > 100) throw new RangeError(`Symlink target exceeds the USTAR field limit: ${path}`);
-    }
     if (!(data instanceof Uint8Array)) throw new TypeError("File entries require Uint8Array bytes");
-    const blocks = Math.ceil(data.length / 512) * 512;
-    length += 512 + blocks;
+    const member = tarMember({ ...entry, size: data.length, target: entry.kind === "symlink" ? entry.target : undefined });
+    if (prepared.has(member.name)) throw new TypeError(`Duplicate layer path: ${member.name}`);
+    length += member.bytes;
     if (length > maxBytes || prepared.size >= 4096) throw new RangeError("Layer exceeds the workspace profile limits");
-    prepared.set(path, { data, blocks, kind: entry.kind, executable: entry.executable, target });
+    prepared.set(member.name, { data, ...member });
   }
   if (!Number.isSafeInteger(maxBytes) || length > maxBytes) throw new RangeError("Invalid or exceeded layer byte limit");
   const bytes = new Uint8Array(length);
   let offset = 0;
   for (const path of [...prepared.keys()].sort()) {
-    const { data, blocks, kind, executable, target } = prepared.get(path);
-    bytes.set(headerFor(path, kind, data.length, executable, target), offset);
-    offset += 512;
-    bytes.set(data, offset);
-    offset += blocks;
+    const member = prepared.get(path);
+    bytes.set(member.header, offset);
+    bytes.set(member.data, offset + 512);
+    offset += member.bytes;
   }
   return bytes;
 }

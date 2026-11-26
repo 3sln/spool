@@ -10,6 +10,7 @@ export const MEDIA = [
   "application/vnd.oci.image.layer.v1.tar",
   "application/vnd.oci.image.layer.v1.tar+gzip",
 ];
+export const PATCH_MEDIA = "application/vnd.spool.workspace.patch.v1+vcdiff";
 const MIB = 1024 ** 2;
 export const INLINE_ARTIFACT_BYTES = 512 * 1024;
 const resourceFields = ["cpu", "memory_mib", "disk_mib"];
@@ -63,10 +64,10 @@ function resourceProfiles(limits) {
 }
 
 export function capabilities(auth, execution, limits = LIMITS) {
-  const { resource_profiles, default_resource_profile, artifact_layer_sources, artifact_presigned_get, ...publishedLimits } = limits;
+  const { resource_profiles, default_resource_profile, artifact_layer_sources, artifact_presigned_get, patch_layers, ...publishedLimits } = limits;
   return {
     protocol_versions: ["0.1"], platforms: ["linux/amd64"], bases: [BASE],
-    layer_media_types: MEDIA, transports: ["http+sse"],
+    layer_media_types: patch_layers ? [...MEDIA, PATCH_MEDIA] : MEDIA, transports: ["http+sse"],
     features: ["lazy-layers", "cancel", "artifact-download", "cache-retention", "deadline-extension", "live-logs", "task-shards",
       ...(artifact_layer_sources ? ["artifact-layer-source"] : [])],
     filesystem: "workspace-oci-tar-subset",
@@ -129,12 +130,18 @@ export function planManifest(value, limits = LIMITS) {
   let total = 0;
   let uncompressed = 0;
   const sizes = new Map();
-  for (const layer of environment.layers) {
+  for (const [index, layer] of environment.layers.entries()) {
     shape(layer, ["digest", "media_type", "size"]);
     if (!string(layer.digest, 71) || !digestPattern.test(layer.digest) || !Number.isSafeInteger(layer.size)
       || layer.size < 1) invalid("Invalid layer descriptor");
     if (layer.size > limits.max_layer_bytes) throw new Fault("RESOURCE_LIMIT", "Layer size exceeds the runner limit", 413);
-    if (!MEDIA.includes(layer.media_type)) throw new Fault("UNSUPPORTED_PLATFORM", "Select an advertised layer media type");
+    if (layer.media_type === PATCH_MEDIA && limits.patch_layers) {
+      if (layer.size <= 45 || ![MEDIA[0], PATCH_MEDIA].includes(environment.layers[index - 1]?.media_type)) {
+        invalid("A VCDIFF layer must immediately follow its uncompressed tar or previous patch");
+      }
+    } else if (!MEDIA.includes(layer.media_type)) {
+      throw new Fault("UNSUPPORTED_PLATFORM", "Select an advertised layer media type");
+    }
     const prior = sizes.get(layer.digest);
     if (prior && (prior.size !== layer.size || prior.media_type !== layer.media_type)) invalid("Conflicting layer descriptors");
     sizes.set(layer.digest, layer);

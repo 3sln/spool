@@ -6,7 +6,7 @@ mod replay;
 
 pub use cache_leases::DEFAULT_LEASE_TTL;
 pub use layer::{
-    CacheGc, Entry, LayerCache, TAR, TAR_GZIP, build_layer, describe, describe_reader,
+    CacheGc, Entry, LayerCache, PATCH_MEDIA, TAR, TAR_GZIP, build_layer, describe, describe_reader,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
