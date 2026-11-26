@@ -70,16 +70,16 @@ test("pull plans fetch only from configured origins and admit only verified byte
   const input = Uint8Array.of(1, 2, 3);
   const layer = await layerDescriptor(input);
   const seen = [];
-  const { client, state, blobs } = fixture({
-    layerPullOrigins: ["https://objects.example"],
-    pullFetch(url, request) {
+  const { client, state, blobs } = fixture({ layerPull: {
+    origins: ["https://objects.example"],
+    fetch(url, request) {
       seen.push({ url, request });
       if (url.pathname === "/redirect") return Response.redirect("https://other.example");
       if (url.pathname === "/bad") return new Response(Uint8Array.of(1, 2, 4));
       if (url.pathname === "/large") return new Response(Uint8Array.of(1, 2, 3, 4));
       return new Response(input);
     },
-  });
+  } });
   assert.ok((await client.capabilities()).features.includes("layer-pull"));
   const { task_id: id, required, upload_plans: plans } = await client.submit(manifest("pull", [layer]));
   assert.match(plans[layer.digest].pull_url, /\/pull$/);
@@ -104,6 +104,35 @@ test("pull plans fetch only from configured origins and admit only verified byte
   assert.equal((await client.status(id)).state, "QUEUED");
   await client.cancel(id);
   assert.equal((await client.submit(manifest("pull-reuse", [layer]))).required.length, 0);
+});
+
+test("an embedder can authorize a newly registered origin per tenant", async () => {
+  const input = Uint8Array.of(42);
+  const layer = await layerDescriptor(input);
+  const approved = new Map();
+  const requests = [];
+  const lookups = [];
+  const { client } = fixture({ layerPull: {
+    authorize({ tenant, origin }) {
+      lookups.push({ tenant, origin });
+      return approved.get(tenant) === origin;
+    },
+    fetch(url) {
+      requests.push(url.origin);
+      return new Response(input);
+    },
+  } });
+  assert.ok((await client.capabilities()).features.includes("layer-pull"));
+  const { task_id } = await client.submit(manifest("tenant-source", [layer]));
+  const url = "https://user-objects.example/archive";
+  await assert.rejects(client.pullLayer(crypto.randomUUID(), layer.digest, url), { status: 404 });
+  assert.equal(lookups.length, 0);
+  await assert.rejects(client.pullLayer(task_id, layer.digest, url), { code: "LAYER_PULL_ORIGIN" });
+  assert.deepEqual(requests, []);
+  const [{ tenant, origin }] = lookups;
+  approved.set(tenant, origin);
+  assert.equal((await client.pullLayer(task_id, layer.digest, url)).state, "QUEUED");
+  assert.deepEqual(requests, [origin]);
 });
 
 test("the core uses custom persistence, content, execution and discovery providers", async () => {

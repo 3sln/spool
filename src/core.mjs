@@ -62,14 +62,12 @@ export function createRunnerHandler({ auth, execution, limits, origins = [], dis
 
 export function createRunnerCore({
   auth, execution, store, layers, artifacts, transfers, limits = {}, origins, concurrency = 1, wake, stop,
-  layerPullOrigins = [], layerPullTimeoutSeconds, pullFetch,
+  layerPull: pullOptions = {},
 }) {
-  const layerPull = configuredLayerPull({
-    SPOOL_LAYER_PULL_ORIGINS: layerPullOrigins.join(","), SPOOL_LAYER_PULL_TIMEOUT_SECONDS: layerPullTimeoutSeconds,
-  }, layers);
+  const layerPull = configuredLayerPull({}, layers, pullOptions);
   const policy = Object.freeze({ ...providerLimits(limits, transfers, artifacts),
     artifact_layer_sources: Boolean(artifacts && typeof layers?.putVerified === "function"),
-    artifact_presigned_get: typeof artifacts?.presignDownload === "function", layer_pull: layerPull.origins.size > 0 });
+    artifact_presigned_get: typeof artifacts?.presignDownload === "function", layer_pull: layerPull.enabled });
   methods(store, "store", ["get", "list", "commit"]);
   methods(layers, "layers", ["has", "delete"]);
   methods(layers, "layers", [typeof layers.open === "function" ? "open" : "get"]);
@@ -80,7 +78,7 @@ export function createRunnerCore({
   if (wake !== undefined && typeof wake !== "function") throw new TypeError("wake must be a function");
   if (stop !== undefined && typeof stop !== "function") throw new TypeError("stop must be a function");
   const service = new TaskService(store, layers, {
-    artifactStorage: artifacts, transfers, limits: policy, concurrency, wake, stop, layerPull, pullFetch,
+    artifactStorage: artifacts, transfers, limits: policy, concurrency, wake, stop, layerPull,
   });
   const fetch = createRunnerHandler({
     auth, execution, limits: service.limits, origins, dispatch: (request, tenant) => taskEndpoint(request, tenant, service),

@@ -64,8 +64,8 @@ export async function start(env = process.env, overrides = {}) {
   limits.artifact_layer_sources = true;
   limits.patch_layers = overrides.executor === undefined;
   limits.artifact_presigned_get = Boolean(objectStorage);
-  const layerPull = configuredLayerPull(env);
-  limits.layer_pull = layerPull.origins.size > 0;
+  const layerPull = configuredLayerPull(env, undefined, overrides.layerPull);
+  limits.layer_pull = layerPull.enabled;
   const workers = Number(env.SPOOL_CONCURRENCY ?? 1);
   const port = Number(env.PORT ?? 8787);
   if (!Number.isInteger(workers) || workers < 1 || workers > 64) throw new Error("Invalid SPOOL_CONCURRENCY");

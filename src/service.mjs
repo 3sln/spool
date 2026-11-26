@@ -51,7 +51,7 @@ export class TaskService {
 
   constructor(store, blobs, {
     wake = async () => {}, stop = async () => {}, concurrency = 1, limits = LIMITS, transfers, artifactStorage,
-    layerPull = { origins: new Set(), timeout: 300 }, pullFetch = globalThis.fetch.bind(globalThis),
+    layerPull = { enabled: false },
   } = {}) {
     this.store = store;
     this.blobs = blobs;
@@ -62,7 +62,6 @@ export class TaskService {
     this.transfers = transfers;
     this.artifactStorage = artifactStorage;
     this.layerPull = layerPull;
-    this.pullFetch = pullFetch;
   }
 
   // Persist each transition and its indexes atomically. Executors run outside this queue.
@@ -153,7 +152,7 @@ export class TaskService {
         id, tenant, fingerprint, envDigest, manifest, resourceProfile, events: [], state: "ACCEPTED",
         created_at: new Date(accepted).toISOString(), taskDeadline, hardDeadline, admissionLimit,
         deadline, missing: [], artifacts: [],
-        ...(this.layerPull.origins.size && { pullLayers: true }),
+        ...(this.layerPull.enabled && { pullLayers: true }),
         ...(this.limits.max_gateway_layer_bytes && { gatewayMaxLayerBytes: this.limits.max_gateway_layer_bytes }),
         commandTimeout: manifest.resources.timeout_s ?? this.limits.max_job_seconds,
       };
@@ -355,8 +354,11 @@ export class TaskService {
   }
 
   async pullLayer(tenant, id, digest, plan, callerSignal) {
-    if (!this.layerPull.origins.size) throw new Fault("NOT_FOUND", "Layer pull is disabled", 404);
-    const download = layerDownload(plan, this.layerPull.origins);
+    if (!this.layerPull.enabled) throw new Fault("NOT_FOUND", "Layer pull is disabled", 404);
+    const download = layerDownload(plan);
+    if (!this.layerPull.origins.has(download.url.origin) && !this.layerPull.authorize) {
+      throw new Fault("LAYER_PULL_ORIGIN", "Layer download origin is outside the runner policy", 403);
+    }
     const lock = `${tenant}/${id}/${digest}`;
     const existing = this.#pulling.get(lock);
     if (existing) return existing;
@@ -393,7 +395,13 @@ export class TaskService {
     let stored = false;
     let writing = false;
     try {
-      const response = await this.pullFetch(download.url, {
+      const { origins, authorize, transport } = this.layerPull;
+      const origin = download.url.origin;
+      if (!origins.has(origin) && await authorize({ tenant, origin, signal }) !== true) {
+        throw new Fault("LAYER_PULL_ORIGIN", "Layer download origin is outside the runner policy", 403);
+      }
+      signal.throwIfAborted();
+      const response = await transport(download.url, {
         method: "GET", headers: download.headers, redirect: "manual", credentials: "omit", signal,
       });
       if (response.status !== 200 || !response.body) {

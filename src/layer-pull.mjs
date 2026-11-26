@@ -10,16 +10,21 @@ export function layerPullOrigins(values = []) {
   }));
 }
 
-export function configuredLayerPull(env, layers) {
-  const origins = layerPullOrigins((env.SPOOL_LAYER_PULL_ORIGINS ?? "").split(",").filter((value) => value.trim()));
-  const timeout = Number(env.SPOOL_LAYER_PULL_TIMEOUT_SECONDS ?? 300);
+export function configuredLayerPull(env, layers, { origins: additionalOrigins = [], timeoutSeconds, authorize, fetch: transport } = {}) {
+  const configured = (env.SPOOL_LAYER_PULL_ORIGINS ?? "").split(",").filter((value) => value.trim());
+  const origins = layerPullOrigins([...configured, ...additionalOrigins]);
+  const timeout = Number(timeoutSeconds ?? env.SPOOL_LAYER_PULL_TIMEOUT_SECONDS ?? 300);
   if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 600) {
     throw new TypeError("SPOOL_LAYER_PULL_TIMEOUT_SECONDS must be an integer from 1 to 600");
   }
-  if (layers && origins.size && typeof (layers.importVerified ?? layers.putVerified) !== "function") {
+  const enabled = origins.size > 0 || typeof authorize === "function";
+  if ((authorize !== undefined && typeof authorize !== "function") || (transport !== undefined && typeof transport !== "function")) {
+    throw new TypeError("Layer pull authorize and fetch must be functions");
+  }
+  if (layers && enabled && typeof (layers.importVerified ?? layers.putVerified) !== "function") {
     throw new TypeError("Layer pull requires a verified streaming layer store");
   }
-  return { origins, timeout };
+  return { enabled, origins, timeout, authorize, transport: transport ?? globalThis.fetch.bind(globalThis) };
 }
 
 const forbidden = new Set([
@@ -28,7 +33,7 @@ const forbidden = new Set([
   "x-http-method", "x-http-method-override", "x-method-override",
 ]);
 
-export function layerDownload(value, origins) {
+export function layerDownload(value) {
   if (typeof value === "string") value = { url: value };
   if (!value || typeof value !== "object" || Array.isArray(value)
     || Object.keys(value).some((key) => !["url", "headers", "method", "expires_at"].includes(key))
@@ -38,8 +43,8 @@ export function layerDownload(value, origins) {
   let url;
   try { url = new URL(value.url); }
   catch { throw new Fault("INVALID_MANIFEST", "Invalid layer download URL"); }
-  if (url.protocol !== "https:" || url.username || url.password || url.hash || !origins.has(url.origin)) {
-    throw new Fault("LAYER_PULL_ORIGIN", "Layer download origin is outside the runner allowlist", 403);
+  if (url.protocol !== "https:" || url.username || url.password || url.hash) {
+    throw new Fault("LAYER_PULL_ORIGIN", "Layer source must use an HTTPS URL", 403);
   }
   const headers = new Headers({ "accept-encoding": "identity" });
   const raw = value.headers === undefined ? {} : value.headers;

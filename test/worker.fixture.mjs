@@ -1,11 +1,19 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
-import worker, { TenantRunner } from "../src/worker.mjs";
+import { createWorkerRunner, TenantRunner } from "../src/worker.mjs";
 import { workerS3Storage } from "../src/worker-s3.mjs";
 import { BASE, MEDIA, sha256 } from "../src/contract.mjs";
 
 const artifactBytes = new Uint8Array(700 * 1024).fill(37);
+const pullBytes = Uint8Array.of(1, 2, 3, 4);
+const layerPull = {
+  authorize: ({ origin }) => origin === "https://custom-layers.example",
+  fetch: () => new Response(pullBytes),
+};
+const worker = createWorkerRunner({ layerPull });
 
 export class TestedTenantRunner extends TenantRunner {
+  static layerPull = layerPull;
+
   constructor(ctx, env) {
     super(ctx, { ...env, LAYERS: {
       head: (key) => env.LAYERS.head(key),
@@ -140,6 +148,9 @@ export default {
       method, body, headers: { authorization: `Bearer ${env.SPOOL_TOKEN}` },
     }), env);
     const info = await (await call("/.well-known/portable-task-runner")).json();
+    if (!info.features.includes("layer-pull") || info.limits.max_gateway_layer_bytes !== 32 * 1024 ** 2) {
+      throw new Error("Expected pull discovery for binding-only storage");
+    }
     if (info.resource_profiles.map(({ name }) => name).join(",") !== "standard-2,standard-3,standard-4") {
       throw new Error("Expected enabled Cloudflare profiles in discovery");
     }
@@ -147,6 +158,17 @@ export default {
     if (rejected.status !== 422 || (await rejected.json()).error !== "RESOURCE_LIMIT") {
       throw new Error("Expected admission to reject an oversized task");
     }
+    const remoteDigest = await sha256(pullBytes);
+    const remote = (size) => JSON.stringify({ ...manifest, client_request_id: "remote-" + size,
+      environment: { base: BASE, layers: [{ digest: remoteDigest, size, media_type: MEDIA[0] }] },
+    });
+    const large = await (await call("/v1/tasks", "POST", remote(33 * 1024 ** 2))).json();
+    if (large.upload_plans?.[remoteDigest]?.type !== "http-pull") throw new Error("Expected large layers to require a pull");
+    await call(large.links.self + "/cancel", "POST");
+    const pull = await (await call("/v1/tasks", "POST", remote(pullBytes.length))).json();
+    const pulled = await call(pull.upload_plans[remoteDigest].pull_url, "POST", JSON.stringify("https://custom-layers.example/layer"));
+    if (pulled.status !== 200 || (await pulled.json()).required.length) throw new Error("Expected a verified pull from a custom origin");
+    await call(pull.links.self + "/cancel", "POST");
     const post = await call("/v1/tasks", "POST", JSON.stringify(manifest));
     if (post.status !== 202) throw new Error(`Submit failed: ${post.status} ${await post.text()}`);
     const initial = await post.json();

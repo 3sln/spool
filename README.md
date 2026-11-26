@@ -108,7 +108,7 @@ Kin generates the event replay policy to JavaScript and Rust. The [Rust SDK](sdk
 
 ## S3 client layer cache and runner pulls
 
-Set `SPOOL_LAYER_PULL_ORIGINS` on the runner to a comma-separated list of trusted HTTPS object storage origins, for example `https://s3.us-east-1.amazonaws.com`. The runner only follows requests to these exact origins, refuses redirects and verifies the byte count and SHA-256 before admitting the layer. `SPOOL_LAYER_PULL_TIMEOUT_SECONDS` defaults to 300 seconds. Gateway PUTs on a Worker with binding-only storage still have a 32 MiB cap. When pulls are enabled the task's layer limit defaults to 512 MiB, and its plans require a pull for layers above the gateway cap.
+Set `SPOOL_LAYER_PULL_ORIGINS` on a stock runner to a comma-separated list of trusted HTTPS origins, for example `https://s3.us-east-1.amazonaws.com`. Embedders can also authorize custom sources dynamically per tenant and provide an outbound transport. The runner refuses redirects and verifies the byte count and SHA-256 before admitting the layer. `SPOOL_LAYER_PULL_TIMEOUT_SECONDS` defaults to 300 seconds. Gateway PUTs on a Worker with binding-only storage still have a 32 MiB cap. When pulls are enabled the task's layer limit defaults to 512 MiB, and its plans require a pull for layers above the gateway cap. See the [runner SDK configuration](protocol/runner-core.md#providers).
 
 ```sh
 spool-mcp run Taskfile.json --profile NAME --s3-cache-bucket my-spool-layers --s3-cache-region us-east-1

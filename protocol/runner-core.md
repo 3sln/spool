@@ -52,7 +52,26 @@ which returns its upload kind synchronously.
 | `transfers` | Optional direct-upload provider described below. |
 | `wake`, `stop` | `wake(job)` schedules a future sweep. It may run before the state transition commits. `stop(id, claim)` signals cancellation or expiry to an external executor. Keep both callbacks idempotent and avoid calling back into the service while awaiting them. |
 
-To offer layer pulls, pass `layerPullOrigins` as an array of trusted HTTPS origins. The layer store must implement `importVerified` or `putVerified` to persist verified streams. Configure an optional `layerPullTimeoutSeconds` or supply `pullFetch` to control the outbound transport.
+To offer layer pulls, configure `layerPull.origins` as an array of trusted HTTPS origins or supply `layerPull.authorize({ tenant, origin, signal })`. The authorizer can look up tenant-specific HTTPS registrations outside the task manifest. Return `true` to approve an origin outside the fixed list. The layer store must implement `importVerified` or `putVerified` to persist verified streams. `layerPull.timeoutSeconds` controls the request budget. An optional `layerPull.fetch(url, options)` can route downloads through egress infrastructure. It must honor manual redirects and the abort signal. For user-managed domains, enforce network destination policy at connection time so DNS changes cannot route an approved origin to internal addresses.
+
+Pass the same `layerPull` object to `createRunnerCore` or to the Node adapter's `start(env, { layerPull })`. For Workers, share it between the request handler and the bound tenant class. Use the corresponding exports from `@3sln/spool-runner/worker-s3` for S3-compatible runner storage.
+
+```js
+import { createWorkerRunner, TenantRunner as BaseTenantRunner } from "@3sln/spool-runner/worker";
+
+const layerPull = {
+  authorize: ({ tenant, origin, signal }) => registeredSources.has(tenant, origin, { signal }),
+  fetch: egressFetch,
+};
+
+export class TenantRunner extends BaseTenantRunner {
+  static layerPull = layerPull;
+}
+
+export default createWorkerRunner({ layerPull });
+```
+
+In this example the application supplies the registration store and egress transport. An HTTPS gateway can expose layers stored with another protocol, such as NATS Object Store, and use the same Spool download plan.
 
 Streaming writers must verify both the exact byte count and SHA-256 digest
 before exposing bytes. Storage keys are opaque, deletes must tolerate missing
