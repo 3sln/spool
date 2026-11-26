@@ -6,6 +6,10 @@ const runnerOptions = `  --profile NAME      Local auth profile. Defaults to SPO
   --source-root PATH  Also allow sources recipes to read this directory. Repeat as needed.
   --allow-source-diff-command
                       Allow trusted Taskfiles to run their optional local diff command.
+  --s3-cache-bucket NAME  Store and read content-addressed layers in this S3 bucket.
+  --s3-cache-region NAME  AWS signing region. Default us-east-1.
+  --s3-cache-endpoint URL Custom HTTPS S3 endpoint.
+  --s3-cache-prefix PATH  Object key prefix. Default spool/layers.
   --state-mode MODE   shared (default), isolated (temporary), or custom.
   --state-dir PATH    Custom state root. Providing it selects custom mode
                       unless an explicit mode overrides it.`;

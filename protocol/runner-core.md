@@ -52,6 +52,8 @@ which returns its upload kind synchronously.
 | `transfers` | Optional direct-upload provider described below. |
 | `wake`, `stop` | `wake(job)` schedules a future sweep. It may run before the state transition commits. `stop(id, claim)` signals cancellation or expiry to an external executor. Keep both callbacks idempotent and avoid calling back into the service while awaiting them. |
 
+To offer layer pulls, pass `layerPullOrigins` as an array of trusted HTTPS origins. The layer store must implement `importVerified` or `putVerified` to persist verified streams. Configure an optional `layerPullTimeoutSeconds` or supply `pullFetch` to control the outbound transport.
+
 Streaming writers must verify both the exact byte count and SHA-256 digest
 before exposing bytes. Storage keys are opaque, deletes must tolerate missing
 objects, and retries must preserve bytes already published under the same key.

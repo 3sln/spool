@@ -342,6 +342,17 @@ impl Client {
         self.json("POST", &format!("{}/cancel", task_path(id)?), None)
     }
 
+    /// Give the runner a presigned GET URL or a JSON download plan for a requested layer.
+    pub fn pull_layer(&self, id: &str, digest: &str, download: &Value) -> Result<Task> {
+        let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+        if hex.len() != 64 || !hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(Error::Invalid("Invalid layer digest"));
+        }
+        let path = format!("{}/layers/{digest}/pull", task_path(id)?);
+        let body = serde_json::to_vec(download)?;
+        retry(|| self.json("POST", &path, Some(&body)))
+    }
+
     pub fn upload(&self, id: &str, layer: &Descriptor, bytes: &[u8]) -> Result<()> {
         if &describe(bytes, &layer.media_type)? != layer {
             return Err(Error::Invalid("Layer bytes do not match the descriptor"));

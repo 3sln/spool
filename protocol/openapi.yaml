@@ -101,6 +101,20 @@ paths:
           description: The transfer plan with concrete URLs for the requesting client.
           content: { application/json: { schema: { $ref: '#/components/schemas/UploadPlan' } } }
         default: { $ref: '#/components/responses/Error' }
+  /v1/tasks/{id}/layers/{digest}/pull:
+    parameters: [{ $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/Digest' }]
+    post:
+      operationId: pullLayer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LayerDownload' }
+      responses:
+        '200':
+          description: The layer was verified against the submitted descriptor.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } }
+        default: { $ref: '#/components/responses/Error' }
   /v1/tasks/{id}/layers/{digest}/complete:
     parameters: [{ $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/Digest' }]
     post:
@@ -283,7 +297,7 @@ components:
       type: object
       required: [type, max_size, expires_at]
       properties:
-        type: { enum: [http-put, presigned-put, presigned-multipart] }
+        type: { enum: [http-put, presigned-put, presigned-multipart, http-pull] }
         method: { const: PUT }
         max_size: { type: integer, minimum: 1 }
         expires_at: { type: string, format: date-time }
@@ -291,6 +305,7 @@ components:
         bearer_token: { type: string }
         url: { type: string, format: uri-reference }
         prepare_url: { type: string, format: uri-reference }
+        pull_url: { type: string, format: uri-reference }
         complete_url: { type: string, format: uri-reference }
         part_size: { type: integer, minimum: 1 }
         parts:
@@ -303,6 +318,20 @@ components:
               offset: { type: integer, minimum: 0 }
               size: { type: integer, minimum: 1 }
               url: { type: string, format: uri }
+    LayerDownload:
+      oneOf:
+        - { type: string, format: uri, description: Presigned HTTPS GET URL. }
+        - type: object
+          required: [url]
+          additionalProperties: false
+          properties:
+            url: { type: string, format: uri }
+            method: { const: GET }
+            headers:
+              type: object
+              maxProperties: 24
+              additionalProperties: { type: string, maxLength: 4096 }
+            expires_at: { type: string, format: date-time }
     Event:
       type: object
       required: [job_id, sequence, type, time, data]

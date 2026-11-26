@@ -1,4 +1,5 @@
 import { canonical, digestPattern, Fault, INLINE_ARTIFACT_BYTES, json, LIMITS, planManifest, readBytes, sha256, terminal } from "./contract.mjs";
+import { layerDownload, storePulledLayer } from "./layer-pull.mjs";
 
 const seconds = (value) => value * 1000;
 const taskKey = (id) => `task/${id}`;
@@ -7,6 +8,7 @@ const historyKey = (id) => `history/${id}`;
 const cacheKey = (tenant, digest) => `${tenant}/${digest}`;
 const leaseKey = (key) => `cache/${key}`;
 const stagingKey = (key) => `upload-stage/${key}`;
+const pullStageKey = (key) => `pull-stage/${key}`;
 const nowISO = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -16,8 +18,11 @@ function event(job, type, data = {}) {
 
 function uploadPlan(job, descriptor) {
   const root = `/v1/tasks/${job.id}/layers/${descriptor.digest}`;
-  const common = { max_size: descriptor.size, expires_at: new Date(job.deadline).toISOString() };
+  const common = { max_size: descriptor.size, expires_at: new Date(job.deadline).toISOString(),
+    ...(job.pullLayers && { pull_url: `${root}/pull` }),
+  };
   const type = job.transferKinds?.[descriptor.digest] ?? "http-put";
+  if (type === "http-put" && descriptor.size > job.gatewayMaxLayerBytes) return { ...common, type: "http-pull" };
   return type === "http-put" ? {
     ...common, type, method: "PUT", authenticated: true, url: `${root}?capability=${job.uploadToken}`,
   } : { ...common, type, prepare_url: `${root}/upload` };
@@ -42,8 +47,12 @@ function state(job) {
 export class TaskService {
   #tail = Promise.resolve();
   #running = new Map();
+  #pulling = new Map();
 
-  constructor(store, blobs, { wake = async () => {}, stop = async () => {}, concurrency = 1, limits = LIMITS, transfers, artifactStorage } = {}) {
+  constructor(store, blobs, {
+    wake = async () => {}, stop = async () => {}, concurrency = 1, limits = LIMITS, transfers, artifactStorage,
+    layerPull = { origins: new Set(), timeout: 300 }, pullFetch = globalThis.fetch.bind(globalThis),
+  } = {}) {
     this.store = store;
     this.blobs = blobs;
     this.wake = wake;
@@ -52,6 +61,8 @@ export class TaskService {
     this.concurrency = concurrency;
     this.transfers = transfers;
     this.artifactStorage = artifactStorage;
+    this.layerPull = layerPull;
+    this.pullFetch = pullFetch;
   }
 
   // Persist each transition and its indexes atomically. Executors run outside this queue.
@@ -142,6 +153,8 @@ export class TaskService {
         id, tenant, fingerprint, envDigest, manifest, resourceProfile, events: [], state: "ACCEPTED",
         created_at: new Date(accepted).toISOString(), taskDeadline, hardDeadline, admissionLimit,
         deadline, missing: [], artifacts: [],
+        ...(this.layerPull.origins.size && { pullLayers: true }),
+        ...(this.limits.max_gateway_layer_bytes && { gatewayMaxLayerBytes: this.limits.max_gateway_layer_bytes }),
         commandTimeout: manifest.resources.timeout_s ?? this.limits.max_job_seconds,
       };
       event(job, "task.accepted", { request_id: manifest.client_request_id });
@@ -233,7 +246,7 @@ export class TaskService {
       const job = await this.find(id, tenant);
       const descriptor = this.uploadDescriptor(job, digest);
       const plan = uploadPlan(job, descriptor);
-      if (plan.type === "http-put") return { plan };
+      if (plan.type === "http-put" || plan.type === "http-pull") return { plan };
       if (job.state !== "WAITING_FOR_LAYER" || job.deadline <= Date.now()) throw new Fault("FORBIDDEN", "Upload plan expired", 403);
       if (!this.transfers) throw new Fault("LAYER_UNAVAILABLE", "Direct uploads are unavailable", 503);
       job.uploadStages ??= {};
@@ -309,7 +322,9 @@ export class TaskService {
         throw new Fault("FORBIDDEN", "Upload capability is invalid or expired", 403);
       }
       if (job.transferKinds?.[digest]) throw new Fault("FORBIDDEN", "Use the direct upload plan", 403);
-      return this.uploadDescriptor(job, digest);
+      const descriptor = this.uploadDescriptor(job, digest);
+      if (descriptor.size > job.gatewayMaxLayerBytes) throw new Fault("LAYER_PULL_REQUIRED", "Use the layer download plan for this size", 413);
+      return descriptor;
     });
     const key = cacheKey(tenant, digest);
     let bytes;
@@ -318,7 +333,7 @@ export class TaskService {
       await this.locked(async () => {
         const previous = await this.store.get(leaseKey(key));
         if (!previous || previous.expires <= Date.now()) {
-          await this.store.commit({ [leaseKey(key)]: { size: descriptor.size, expires: Date.now() + seconds(this.limits.cache_ttl_seconds) } });
+          await this.leaseLayer(key, descriptor.size);
         }
       });
     } else {
@@ -339,8 +354,106 @@ export class TaskService {
     });
   }
 
-  async recordLayer(job, { digest, size }, key, storage) {
-    await this.store.commit({ [leaseKey(key)]: { size, storage, expires: Date.now() + seconds(this.limits.cache_ttl_seconds) } });
+  async pullLayer(tenant, id, digest, plan, callerSignal) {
+    if (!this.layerPull.origins.size) throw new Fault("NOT_FOUND", "Layer pull is disabled", 404);
+    const download = layerDownload(plan, this.layerPull.origins);
+    const lock = `${tenant}/${id}/${digest}`;
+    const existing = this.#pulling.get(lock);
+    if (existing) return existing;
+    const pending = this.fetchLayer(tenant, id, digest, download, callerSignal);
+    this.#pulling.set(lock, pending);
+    try { return await pending; }
+    finally { this.#pulling.delete(lock); }
+  }
+
+  async fetchLayer(tenant, id, digest, download, callerSignal) {
+    const storage = `${tenant}/pull/${crypto.randomUUID()}`;
+    const stageKey = pullStageKey(storage);
+    const key = cacheKey(tenant, digest);
+    const work = await this.locked(async () => {
+      const job = await this.find(id, tenant);
+      const descriptor = this.uploadDescriptor(job, digest);
+      if (!job.missing.some((layer) => layer.digest === digest)) return { done: state(job) };
+      const deadline = Math.min(job.deadline, download.expires, Date.now() + seconds(this.layerPull.timeout));
+      if (job.state !== "WAITING_FOR_LAYER" || deadline <= Date.now()) {
+        throw new Fault("FORBIDDEN", "Task can no longer accept this layer download plan", 403);
+      }
+      await this.wake(job);
+      const cached = await this.store.get(leaseKey(key));
+      if (cached && cached.expires > Date.now() && cached.size === descriptor.size && await this.blobs.has(cached.storage ?? key)) {
+        return { done: await this.recordLayer(job, descriptor, key, cached.storage) };
+      }
+      await this.store.commit({ [stageKey]: { storage, expires: deadline + seconds(60) } });
+      return { descriptor, deadline };
+    });
+    if (work.done) return work.done;
+    const { descriptor, deadline } = work;
+    const signal = AbortSignal.any([...(callerSignal ? [callerSignal] : []), AbortSignal.timeout(Math.max(0, deadline - Date.now()))]);
+    let published = false;
+    let stored = false;
+    let writing = false;
+    try {
+      const response = await this.pullFetch(download.url, {
+        method: "GET", headers: download.headers, redirect: "manual", credentials: "omit", signal,
+      });
+      if (response.status !== 200 || !response.body) {
+        await response.body?.cancel();
+        throw new Fault("LAYER_PULL_FAILED", "Layer source did not return an HTTP 200 response",
+          response.status === 429 || response.status >= 500 ? 503 : 422);
+      }
+      const size = response.headers.get("content-length");
+      const encoding = response.headers.get("content-encoding");
+      if ((size !== null && Number(size) !== descriptor.size) || (encoding && encoding.toLowerCase() !== "identity")) {
+        await response.body.cancel();
+        throw new Fault("LAYER_INVALID", "Layer source size or encoding does not match the descriptor", 422);
+      }
+      const write = this.blobs.importVerified ?? this.blobs.putVerified;
+      try {
+        writing = true;
+        await storePulledLayer(response, descriptor, signal, (input) => write.call(this.blobs, storage, input, descriptor));
+        stored = true;
+      }
+      catch (error) {
+        if (signal.aborted) throw error;
+        throw new Fault("LAYER_INVALID", "Downloaded layer could not be verified and stored", 422);
+      }
+      return await this.locked(async () => {
+        const job = await this.find(id, tenant);
+        if (job.uploaded?.includes(digest) && !job.missing.some((layer) => layer.digest === digest)) return state(job);
+        if (job.state !== "WAITING_FOR_LAYER" || job.deadline <= Date.now()) {
+          throw new Fault("FORBIDDEN", "Task can no longer accept layers", 403);
+        }
+        await this.wake(job);
+        const cached = await this.store.get(leaseKey(key));
+        if (cached && cached.expires > Date.now() && cached.size === descriptor.size && await this.blobs.has(cached.storage ?? key)) {
+          return this.recordLayer(job, descriptor, key, cached.storage);
+        }
+        return this.recordLayer(job, descriptor, key, storage, [stageKey], () => { published = true; });
+      });
+    } catch (error) {
+      if (error instanceof Fault) throw error;
+      throw new Fault("LAYER_PULL_FAILED", signal.aborted ? "Layer download was interrupted or timed out" : "Layer source could not be reached or stored", 422);
+    } finally {
+      if (!published) await this.locked(async () => {
+        await this.blobs.delete(storage);
+        if (!writing || stored) await this.store.commit({}, [stageKey]);
+      }).catch(() => {});
+    }
+  }
+
+  async leaseLayer(key, size, storage, removes = []) {
+    const previous = await this.store.get(leaseKey(key));
+    const entries = { [leaseKey(key)]: { size, storage, expires: Date.now() + seconds(this.limits.cache_ttl_seconds) } };
+    const retired = previous && (previous.storage ?? key);
+    if (retired && retired !== (storage ?? key)) {
+      entries[pullStageKey(retired)] = { storage: retired, cache: key, expires: Date.now() + seconds(60) };
+    }
+    await this.store.commit(entries, removes);
+  }
+
+  async recordLayer(job, { digest, size }, key, storage, removes = [], onRecorded) {
+    await this.leaseLayer(key, size, storage, removes);
+    onRecorded?.();
     job.uploaded ??= [];
     if (!job.uploaded.includes(digest)) job.uploaded.push(digest);
     event(job, "layer.available", { digest, size });
@@ -584,6 +697,14 @@ export class TaskService {
         await this.transfers.discard(stage);
         await this.store.commit({}, [key]);
       }
+      for (const [key, stage] of await this.store.list("pull-stage/")) {
+        if (stage.expires > current) continue;
+        const currentLease = stage.cache && await this.store.get(leaseKey(stage.cache));
+        if (!currentLease || (currentLease.storage ?? stage.cache) !== stage.storage) {
+          await this.blobs.delete(stage.storage);
+        }
+        await this.store.commit({}, [key]);
+      }
       for (const [key, expires] of await this.store.list("history/")) {
         if (expires > current) continue;
         const jobKey = taskKey(key.slice(8));
@@ -601,6 +722,7 @@ export class TaskService {
       if ((await this.store.list("active/")).length) next = Date.now() + 5000;
       for (const [, lease] of await this.store.list("cache/")) next = Math.min(next, lease.expires);
       for (const [, stage] of await this.store.list("upload-stage/")) next = Math.min(next, stage.expires);
+      for (const [, stage] of await this.store.list("pull-stage/")) next = Math.min(next, stage.expires);
       for (const [, expires] of await this.store.list("history/")) next = Math.min(next, expires);
       return next;
     });
@@ -617,6 +739,7 @@ export class TaskService {
         const key = cacheKey(job.tenant, layer.digest);
         const lease = await this.store.get(leaseKey(key));
         if (!lease || lease.expires <= Date.now() || !await this.blobs.has(lease.storage ?? key)) {
+          if (lease) await this.blobs.delete(lease.storage ?? key);
           await this.store.commit({}, [leaseKey(key)]);
           await this.resolve(job);
           await this.save(job);

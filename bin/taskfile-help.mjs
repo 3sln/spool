@@ -43,6 +43,8 @@ base images, features, byte limits, and resource profile.
   client's build engine independently of the task's runner profile.
 - An artifact recipe references a producer task_id and its archive path.
   The same runner can use it as a verified layer without a client upload.
+- A cached recipe references an existing layer by its sha256: digest in the
+  configured cache. Supply media_type if the cache does not record it.
 - Paths in extends and layer recipes are relative to the Taskfile that declares
   them and must resolve inside the project workspace. Guest command and output
   paths refer to the assembled /workspace. The host checkout isn't mounted.
@@ -76,9 +78,10 @@ base images, features, byte limits, and resource profile.
 3. Call submit_template with the relative Taskfile path. Save its task_id.
    Optional shards runs independent copies with SPOOL_SHARD_INDEX and
    SPOOL_SHARD_COUNT. Wait on every returned task ID.
-4. Call wait_task with that ID. It uploads requested layers from the local cache
+4. Call wait_task with that ID. It supplies requested layers from the configured cache
    and returns the task state. Use wait_s of at most 100 for each call and
-   call again when the task state is still nonterminal.
+   call again when the task state is still nonterminal. Use supply_layers first
+   for long transfers or pull_layer to provide a URL or authenticated download plan.
 5. Use task_events to page through logs. Pass next_cursor from the previous page
    as cursor to continue. Use task_artifacts and read_artifact for outputs.
    read_artifact reads files up to 512 KiB and supports UTF-8 text.

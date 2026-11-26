@@ -23,7 +23,21 @@ async function runnerClient(options, env, cache) {
     ...await runnerConnection(options, env),
     allowTransferURL: (url) => (env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((item) => item.trim()).includes(url.origin),
     layerSource: cache.open,
+    layerPullSource: cache.pullPlan,
   });
+}
+
+async function cliCache(directory, workspace, options, env) {
+  const bucket = options["s3-cache-bucket"] ?? env.SPOOL_CACHE_S3_BUCKET;
+  const config = { workspace, leaseTtlMs: env.SPOOL_CACHE_LEASE_SECONDS === undefined ? undefined : Number(env.SPOOL_CACHE_LEASE_SECONDS) * 1000 };
+  if (!bucket) return openLayerCache(directory, config);
+  const { openS3LayerCache } = await import("../client/s3-cache.mjs");
+  return openS3LayerCache(directory, {
+    bucket,
+    endpoint: options["s3-cache-endpoint"] ?? env.SPOOL_CACHE_S3_ENDPOINT,
+    region: options["s3-cache-region"] ?? env.SPOOL_CACHE_S3_REGION ?? env.AWS_REGION,
+    prefix: options["s3-cache-prefix"] ?? env.SPOOL_CACHE_S3_PREFIX,
+  }, config);
 }
 
 async function run(options, env) {
@@ -35,9 +49,7 @@ async function run(options, env) {
   process.once("SIGINT", abort);
   process.once("SIGTERM", abort);
   try {
-    const cache = await openLayerCache(state.blobs, { workspace,
-      leaseTtlMs: env.SPOOL_CACHE_LEASE_SECONDS === undefined ? undefined : Number(env.SPOOL_CACHE_LEASE_SECONDS) * 1000,
-    });
+    const cache = await cliCache(state.blobs, workspace, options, env);
     const client = await runnerClient(options, env, cache);
     const { task } = await runTaskFile(file, {
       client, cache, contextRoot: workspace, ...sourceOptions(options), requestId: options["request-id"],
@@ -65,8 +77,7 @@ async function serve(options, env) {
   try {
     const workspacePathOption = options.workspace ?? env.SPOOL_WORKSPACE_ROOT ?? env.CLAUDE_PROJECT_DIR;
     const workspace = workspacePathOption && await realpath(workspacePathOption);
-    const leaseTtlMs = env.SPOOL_CACHE_LEASE_SECONDS === undefined ? undefined : Number(env.SPOOL_CACHE_LEASE_SECONDS) * 1000;
-    cache = await openLayerCache(state.blobs, { workspace: workspace || undefined, leaseTtlMs });
+    cache = await cliCache(state.blobs, workspace || undefined, options, env);
     const client = await runnerClient(options, env, cache);
 
     async function workspacePath(path) {
@@ -132,8 +143,19 @@ async function serve(options, env) {
       }],
       submit_task: ["Submit a manifest. Use build_layer to obtain layer descriptors.", manifestSchema,
         (args, signal) => client.submit(args, { signal })],
+      pull_layer: ["Ask the runner to fetch a requested layer from an allowed HTTPS origin", fields({
+        task_id: id, digest: id, download: { anyOf: [id, fields({
+          url: id, method: { const: "GET" }, headers: { type: "object", additionalProperties: id }, expires_at: id,
+        }, ["url"])] },
+      }), ({ task_id, digest, download }, signal) => client.pullLayer(task_id, digest, download, { signal })],
       task_status: ["Get task status and requested layers", idArgs, ({ task_id }, signal) => client.status(task_id, { signal })],
-      wait_task: ["Upload requested layers from the local cache and wait up to wait_s seconds (default 20). Call again if the returned state is nonterminal.", fields(
+      supply_layers: ["Supply requested layers from the configured cache, including transfers longer than wait_task's polling window", idArgs,
+        async ({ task_id }, signal) => {
+          const task = await client.status(task_id, { signal });
+          await client.supply(task_id, task.required, { plans: task.upload_plans, signal });
+          return client.status(task_id, { signal });
+        }],
+      wait_task: ["Supply requested layers from the configured cache and wait up to wait_s seconds (default 20). Call again if the returned state is nonterminal.", fields(
         { task_id: id, wait_s: { type: "integer", minimum: 1, maximum: maxWaitSeconds, description: "Seconds to wait before returning current status." } }, ["task_id"],
       ), async ({ task_id, wait_s = 20 }, signal) => {
         if (!Number.isSafeInteger(wait_s) || wait_s < 1) throw new TypeError("Invalid wait_s");

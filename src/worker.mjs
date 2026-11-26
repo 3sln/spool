@@ -8,6 +8,7 @@ import { workStream } from "./work-stream.mjs";
 import { r2Transfers } from "./r2-transfer.mjs";
 import { waitForGuest } from "./cloud-startup.mjs";
 import { workerResourcePolicy } from "./worker-resources.mjs";
+import { configuredLayerPull } from "./layer-pull.mjs";
 
 const EXECUTION = {
   network: "container-internet-disabled", cpu: "vm-vcpu-plus-process-rlimit",
@@ -18,12 +19,13 @@ const guestOrigin = "http://spool.internal";
 const tenantHeader = "x-spool-internal-tenant";
 const guestPollMs = 5000;
 const guestIdleMs = 120_000;
-function workerLimits(env, { layers, artifacts, transfers }) {
-  const limits = configuredLimits(env, transfers
-    ? { uploads: ["presigned-put", "presigned-multipart"] }
-    : { layerCeiling: 32, defaultLayer: 32 });
+function workerLimits(env, { layers, artifacts, transfers }, layerPull) {
+  const limits = configuredLimits(env, transfers ? { uploads: ["presigned-put", "presigned-multipart"] }
+    : layerPull.origins.size ? undefined : { layerCeiling: 32, defaultLayer: 32 });
   return { ...limits, ...workerResourcePolicy(env),
+    ...(!transfers && layerPull.origins.size && { max_gateway_layer_bytes: 32 * 1024 ** 2 }),
     patch_layers: true,
+    layer_pull: layerPull.origins.size > 0,
     artifact_layer_sources: Boolean(artifacts && (layers.importVerified || layers.putVerified)),
     artifact_presigned_get: typeof artifacts?.presignDownload === "function",
   };
@@ -35,9 +37,10 @@ export function createWorkerRunner({ auth = configuredAuth, storage = r2Storage 
     fetch(request, env) {
       let endpoint = endpoints.get(env);
       if (!endpoint) {
+        const blobs = storage(env);
         endpoint = createRunnerHandler({
           auth: auth(env), origins: env.SPOOL_ALLOWED_ORIGINS?.split(","),
-          execution: EXECUTION, limits: workerLimits(env, storage(env)),
+          execution: EXECUTION, limits: workerLimits(env, blobs, configuredLayerPull(env, blobs.layers)),
           dispatch(next, tenant) {
             const headers = new Headers(next.headers);
             headers.delete("authorization");
@@ -101,9 +104,10 @@ export class TenantRunner extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     const storage = this.constructor.storage(env);
+    const layerPull = configuredLayerPull(env, storage.layers);
     this.service = new TaskService(stateStorage(ctx.storage), storage.layers, {
-      wake: () => this.schedule(Date.now() + 50), limits: workerLimits(env, storage), transfers: storage.transfers,
-      stop: (id, claim) => this.stop(id, claim), artifactStorage: storage.artifacts,
+      wake: () => this.schedule(Date.now() + 50), limits: workerLimits(env, storage, layerPull), transfers: storage.transfers,
+      stop: (id, claim) => this.stop(id, claim), artifactStorage: storage.artifacts, layerPull,
     });
   }
 

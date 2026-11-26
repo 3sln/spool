@@ -133,6 +133,17 @@
           }
         },
         {
+          "if": { "properties": { "kind": { "const": "cached" } } },
+          "then": {
+            "required": ["digest"], "additionalProperties": false,
+            "properties": {
+              "id": {}, "kind": {},
+              "digest": { "$ref": "urn:3sln:spool:manifest:0.1#/$defs/digest" },
+              "media_type": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        {
           "if": { "properties": { "kind": { "const": "artifact" } } },
           "then": {
             "required": ["task_id", "path"],

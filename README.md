@@ -1,6 +1,6 @@
 # Spool
 
-Spool runs the same portable task manifest on Cloudflare Containers and self-hosted Docker or Podman. Both providers expose the portable HTTP task API. MCP runs over stdio on the client side. Clients keep the authoritative layer bytes and upload on a cache miss. Accepted tasks have durable IDs and continue after a client disconnects.
+Spool runs the same portable task manifest on Cloudflare Containers and self-hosted Docker or Podman. Both providers expose the portable HTTP task API. MCP runs over stdio on the client side. On a runner cache miss, the client can upload a layer or give the runner a URL to fetch it. Accepted tasks have durable IDs and continue after a client disconnects.
 
 ## Install from release artifacts
 
@@ -106,6 +106,19 @@ For presigned transfers, pass an `allowTransferURL` callback that accepts the co
 
 Kin generates the event replay policy to JavaScript and Rust. The [Rust SDK](sdk/rust/README.md) includes blocking HTTP, deterministic USTAR layers, a local cache, replay, and artifact verification. JSON Taskfile compilation is in the JavaScript SDK. Regenerate with `bb client-emit` using sibling Kin and Snug checkouts, or set `SPOOL_KIN_SRC` and `SPOOL_SNUG_KIN_SRC`. The checked-in output runs without Babashka.
 
+## S3 client layer cache and runner pulls
+
+Set `SPOOL_LAYER_PULL_ORIGINS` on the runner to a comma-separated list of trusted HTTPS object storage origins, for example `https://s3.us-east-1.amazonaws.com`. The runner only follows requests to these exact origins, refuses redirects and verifies the byte count and SHA-256 before admitting the layer. `SPOOL_LAYER_PULL_TIMEOUT_SECONDS` defaults to 300 seconds. Gateway PUTs on a Worker with binding-only storage still have a 32 MiB cap. When pulls are enabled the task's layer limit defaults to 512 MiB, and its plans require a pull for layers above the gateway cap.
+
+```sh
+spool-mcp run Taskfile.json --profile NAME --s3-cache-bucket my-spool-layers --s3-cache-region us-east-1
+spool-mcp init --profile NAME --workspace . --s3-cache-bucket my-spool-layers
+```
+
+Use `--s3-cache-endpoint` for a compatible HTTPS service and `--s3-cache-prefix` to change the default `spool/layers` prefix. The corresponding environment variables are `SPOOL_CACHE_S3_BUCKET`, `SPOOL_CACHE_S3_REGION`, `SPOOL_CACHE_S3_ENDPOINT`, and `SPOOL_CACHE_S3_PREFIX`. The CLI uses the AWS SDK credential chain. It signs a short-lived GET for the runner and falls back to a client upload when the runner offers an upload and cannot pull from that origin. Local state still holds recipes and leases. `cache-gc` reclaims local cache files. Use a bucket lifecycle rule to reclaim shared S3 objects.
+
+A Taskfile can reference an existing cache object by digest as `{"id":"dataset","kind":"cached","digest":"sha256:<64 lowercase hex digits>"}`. Objects use the key `<prefix>/<64 lowercase hex digits>`. Supply `media_type` when the object does not have a supported layer media type as its content type. SDK callers can use `openS3LayerCache` from `@3sln/spool-client/s3-cache` and pass `cache.pullPlan` as `layerPullSource`. For a different storage source, use `client.pullLayer(taskId, digest, urlOrPlan)` or the MCP `pull_layer` tool. A plan has a `url`, optional `headers`, and optional `expires_at`. The MCP `supply_layers` tool transfers layers from the configured cache independently of the short `wait_task` polling window.
+
 ## JSON Taskfiles
 
 Run `spool-mcp taskfile` for syntax, inheritance rules, and the submission
@@ -145,7 +158,7 @@ const { task } = await runTaskFile("./examples/taskfiles/check.json", {
 });
 ```
 
-The runner returns any missing digests and an upload plan for each. The client reads those exact bytes from its cache and follows the plan. The runner starts after every layer has been verified. Retries use the same request ID and manifest. A caller can persist the accepted task ID and resume waiting with the same client cache. Use `prepareTaskFile` for the merged manifest and descriptors without submitting.
+The runner returns any missing digests and a transfer plan for each. The client uploads the exact bytes from its cache or supplies a download URL when the plan offers a pull. The runner starts after every layer has been verified. Retries use the same request ID and manifest. A caller can persist the accepted task ID and resume waiting with the same client cache. Use `prepareTaskFile` for the merged manifest and descriptors without submitting.
 
 Paths resolve relative to the file declaring them and stay inside the caller's context root. Directory recipes accept a `previous` snapshot and optional `include` and `exclude` lists of paths or globs relative to the layer directory. For example, `"include": ["src", "docs/**/*.json"], "exclude": ["**/fixtures", ".git"]` selects source and JSON input files. A matched directory includes or excludes its subtree. The same filters apply to both sides of a delta. Archive recipes import prebuilt OCI bytes.
 

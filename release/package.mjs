@@ -16,11 +16,13 @@ const packageInfo = {
 };
 const clientFiles = [
   "client/index.mjs", "client/build-cache.mjs", "client/cache-leases.mjs", "client/container-build.mjs",
-  "client/layers.mjs", "client/node.mjs", "client/source-diff.mjs", "client/source-layers.mjs", "client/taskfile.mjs", "client/generated/js",
+  "client/layers.mjs", "client/node.mjs", "client/s3-cache.mjs", "client/source-diff.mjs", "client/source-layers.mjs", "client/taskfile.mjs", "client/generated/js",
 ];
+const s3CacheDependencies = Object.fromEntries(["@aws-sdk/client-s3", "aws4fetch"].map((name) => [name, source.dependencies[name]]));
 const packages = [
   {
-    manifest: { name: "@3sln/spool-client", description: "Client SDK and layer builders for the Spool task protocol", exports: source.exports },
+    manifest: { name: "@3sln/spool-client", description: "Client SDK and layer builders for the Spool task protocol",
+      exports: source.exports, dependencies: s3CacheDependencies },
     files: clientFiles,
   },
   {
@@ -41,6 +43,7 @@ const packages = [
     manifest: {
       name: "@3sln/spool-mcp", description: "Stdio MCP client for Spool runners",
       bin: { "spool-mcp": "./bin/mcp.mjs" }, publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
+      dependencies: s3CacheDependencies,
     },
     files: [...clientFiles, "bin/mcp.mjs", "bin/mcp-config.mjs", "bin/mcp-auth.mjs", "bin/mcp-help.mjs", "bin/taskfile-help.mjs", "bin/oauth.mjs"],
   },

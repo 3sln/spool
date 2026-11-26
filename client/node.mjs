@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { constants, createWriteStream, openAsBlob } from "node:fs";
 import { lstat, mkdir, open, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
 import { resolve, join, posix } from "node:path";
-import { Transform } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { buildLayer, DEFAULT_LAYER_LIMIT, layerDescriptor, PATCH_MEDIA, TAR, TAR_GZIP } from "./layers.mjs";
 import { resolveBuild, withCacheTransaction } from "./build-cache.mjs";
@@ -30,11 +30,16 @@ async function boundedFile(path, size) {
   } finally { await file.close(); }
 }
 
-export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3, workspace, leaseTtlMs } = {}) {
+export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3, workspace, leaseTtlMs, backing } = {}) {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const root = await realpath(directory);
   const leases = leaseIndex(root);
   const layerPath = (digest) => join(root, keyFor(digest));
+  const fileBlob = (path) => process.versions.bun ? Bun.file(path) : openAsBlob(path);
+  const present = async (path) => (await lstat(path).catch((error) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }))?.isFile() ?? false;
   async function openRegular(path, maximum) {
     const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
@@ -52,10 +57,9 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
     }
     return descriptor.size;
   }
-  async function scan(file, size, signal, destination) {
+  async function scan(input, size, signal, destination) {
     const hash = createHash("sha256");
     let consumed = 0;
-    const input = file.createReadStream({ autoClose: false });
     const verify = (chunk) => {
       consumed += chunk.length;
       if (consumed > size) throw new Error("Layer grew while it was being read");
@@ -78,22 +82,44 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
     if (consumed !== size) throw new Error("Layer changed while it was being read");
     return `sha256:${hash.digest("hex")}`;
   }
+  const readFileHandle = (file) => file.createReadStream({ autoClose: false });
   async function publish(temporary, digest, lease, signal) {
     await leases.transact(async (db) => {
       if (lease) await lease.retain(db, digest);
       await rename(temporary, layerPath(digest));
     }, signal);
   }
+  async function storeArchive(temporary, descriptor, lease, signal) {
+    if (!backing) return publish(temporary, descriptor.digest, lease, signal);
+    await backing.put(descriptor, await fileBlob(temporary), { signal });
+    if (lease) await leases.transact((db) => lease.retain(db, descriptor.digest), signal);
+  }
+
+  async function materialize(descriptor, lease, signal) {
+    const path = layerPath(descriptor.digest);
+    if (!backing || await present(path)) return;
+    const dir = join(root, ".downloads");
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await withCacheTransaction(join(dir, keyFor(descriptor.digest) + ".sqlite"), async () => {
+      if (await present(path)) return;
+      const contents = await backing.read(descriptor.digest, { signal });
+      if (!contents) return;
+      const temporary = join(root, `.${crypto.randomUUID()}.tmp`);
+      try {
+        const digest = await scan(Readable.fromWeb(contents), layerSize(descriptor), signal, temporary);
+        if (digest !== descriptor.digest) throw new Error(`S3 layer cache integrity check failed for ${descriptor.digest}`);
+        await publish(temporary, digest, lease, signal);
+      } finally { await rm(temporary, { force: true }); }
+    }, signal);
+  }
+
   function scoped(lease) {
     async function retain(digest, { signal } = {}) {
       if (!lease) throw new Error("A workspace lease is required");
       const path = layerPath(digest);
+      const remote = backing && !await present(path) && await backing.describe(digest, { signal });
       return leases.transact(async (db) => {
-        const present = await lstat(path).catch((error) => {
-          if (error.code === "ENOENT") return undefined;
-          throw error;
-        });
-        if (!present?.isFile()) return false;
+        if (!remote && !await present(path)) return false;
         await lease.retain(db, digest);
         return true;
       }, signal);
@@ -103,6 +129,10 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
         return scoped(await leases.workspace(directory, ttlMs));
       },
       ...(lease && { leasePath: lease.path, renew: lease.renew, release: lease.release, retain }),
+      ...(backing && {
+        describe: (digest, options) => backing.describe(digest, options),
+        pullPlan: (descriptor, options) => backing.plan(descriptor, options),
+      }),
       async put(bytes, mediaType = TAR) {
         if (!(bytes instanceof Uint8Array)) throw new TypeError("Expected Uint8Array layer bytes");
         if (bytes.length > maxLayerBytes) throw new RangeError("Layer exceeds the cache limit");
@@ -115,12 +145,16 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
             await file.writeFile(snapshot);
             await file.sync();
           } finally { await file.close(); }
-          await publish(temporary, descriptor.digest, lease);
+          await storeArchive(temporary, descriptor, lease);
         } finally { await rm(temporary, { force: true }); }
         return descriptor;
       },
       async source(descriptor, { signal } = {}) {
         signal?.throwIfAborted();
+        if (backing) {
+          const blob = await cache.open(descriptor, { signal });
+          return blob && new Uint8Array(await blob.arrayBuffer());
+        }
         const path = layerPath(descriptor.digest);
         if (lease && !await retain(descriptor.digest, { signal })) return undefined;
         const found = await boundedFile(path, layerSize(descriptor)).catch((error) => {
@@ -136,17 +170,19 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
       },
       async open(descriptor, { signal } = {}) {
         const path = layerPath(descriptor.digest);
+        const size = layerSize(descriptor);
         if (lease && !await retain(descriptor.digest, { signal })) return undefined;
-        const entry = await openRegular(path, layerSize(descriptor)).catch((error) => {
+        await materialize(descriptor, lease, signal);
+        const entry = await openRegular(path, size).catch((error) => {
           if (error.code === "ENOENT") return undefined;
           throw error;
         });
         if (!entry) return undefined;
         try {
-          if (entry.size !== descriptor.size || await scan(entry.file, entry.size, signal) !== descriptor.digest) {
+          if (entry.size !== descriptor.size || await scan(readFileHandle(entry.file), entry.size, signal) !== descriptor.digest) {
             throw new Error(`Layer cache integrity check failed for ${descriptor.digest}`);
           }
-          return process.versions.bun ? Bun.file(path) : await openAsBlob(path);
+          return await fileBlob(path);
         } finally {
           await entry.file.close();
         }
@@ -156,11 +192,12 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
         const entry = await openRegular(path, Math.min(maxBytes, maxLayerBytes));
         const temporary = join(root, `.${crypto.randomUUID()}.tmp`);
         try {
-          const digest = await scan(entry.file, entry.size, signal, temporary);
+          const digest = await scan(readFileHandle(entry.file), entry.size, signal, temporary);
           const written = await open(temporary, "r");
           try { await written.sync(); } finally { await written.close(); }
-          await publish(temporary, digest, lease, signal);
-          return { digest, size: entry.size, media_type: mediaType };
+          const descriptor = { digest, size: entry.size, media_type: mediaType };
+          await storeArchive(temporary, descriptor, lease, signal);
+          return descriptor;
         } finally {
           await entry.file.close();
           await rm(temporary, { force: true });
@@ -176,8 +213,15 @@ export async function openLayerCache(directory, { maxLayerBytes = 2 * 1024 ** 3,
         const key = keyFor(buildKey);
         const index = join(root, ".builds");
         await mkdir(index, { recursive: true, mode: 0o700 });
-        return resolveBuild(join(index, key + ".sqlite"),
-          (descriptor) => cache.open(descriptor, { signal }), build, signal);
+        return resolveBuild(join(index, key + ".sqlite"), async (descriptor) => {
+          if (backing && await backing.has(descriptor, { signal })) {
+            if (lease) await leases.transact((db) => lease.retain(db, descriptor.digest), signal);
+            return true;
+          }
+          const blob = await cache.open(descriptor, { signal });
+          if (blob && backing) await backing.put(descriptor, blob, { signal });
+          return blob;
+        }, build, signal);
       },
       async updateSourceBaseline(key, update, { signal } = {}) {
         const index = join(root, ".sources");

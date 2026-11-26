@@ -10,7 +10,8 @@ const defaults = {
   cursor: ".cursor/mcp.json",
 };
 const modes = new Set(["shared", "isolated", "custom"]);
-const serveFlags = ["runner", "profile", "workspace", "state-mode", "state-dir", "source-root", "allow-source-diff-command"];
+const serveFlags = ["runner", "profile", "workspace", "state-mode", "state-dir", "source-root", "allow-source-diff-command",
+  "s3-cache-bucket", "s3-cache-endpoint", "s3-cache-region", "s3-cache-prefix"];
 const booleanFlags = new Set(["force", "dry-run", "token-stdin", "allow-source-diff-command"]);
 const initFlags = [...serveFlags, "client", "scope", "config", "name", "force", "dry-run"];
 

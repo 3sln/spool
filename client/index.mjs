@@ -80,7 +80,7 @@ async function* frames(body) {
 }
 
 export function createClient({
-  url, fetch: transport = globalThis.fetch, headers, layerSource, allowTransferURL = () => false,
+  url, fetch: transport = globalThis.fetch, headers, layerSource, layerPullSource, allowTransferURL = () => false,
 } = {}) {
   const base = new URL(url);
   if (!["http:", "https:"].includes(base.protocol) || base.username || base.password) throw new TypeError("Invalid runner URL");
@@ -177,17 +177,40 @@ export function createClient({
     }), signal);
   }
 
-  async function supply(id, required, { source = layerSource, signal, plans } = {}) {
-    if (!required.length) return;
-    if (typeof source !== "function") throw new SpoolError("LAYER_UNAVAILABLE", "No layer source is configured");
+  function pullLayer(id, digest, download, { signal, url = `${layerPath(id, digest)}/pull` } = {}) {
+    return retry(() => jsonRequest(url, {
+      method: "POST", body: JSON.stringify(download), signal, extra: { "content-type": "application/json" },
+    }), signal);
+  }
+
+  async function supply(id, required, { source = layerSource, pullSource = layerPullSource, signal, plans } = {}) {
     for (const descriptor of required) {
       signal?.throwIfAborted();
+      const plan = plans?.[descriptor.digest];
+      if (plan?.pull_url && typeof pullSource === "function") {
+        const download = await pullSource(descriptor, { signal });
+        if (download) {
+          try {
+            await pullLayer(id, descriptor.digest, download, { signal, url: plan.pull_url });
+            continue;
+          } catch (error) {
+            if (error.code !== "LAYER_PULL_ORIGIN" || typeof source !== "function") {
+              if (![403, 404, 409].includes(error.status)) throw error;
+              const current = await status(id, { signal });
+              if (current.required.some(({ digest }) => digest === descriptor.digest)) throw error;
+              continue;
+            }
+          }
+        }
+      }
+      if (plan?.type === "http-pull") throw new SpoolError("LAYER_PULL_REQUIRED", "This runner requires a download plan for this layer");
+      if (typeof source !== "function") throw new SpoolError("LAYER_UNAVAILABLE", "No layer source is configured");
       const bytes = await source(descriptor, { signal });
       if (!bytes) throw new SpoolError("LAYER_UNAVAILABLE", `Layer source has no bytes for ${descriptor.digest}`);
       if ((bytes.size ?? bytes.byteLength) !== descriptor.size) {
         throw new SpoolError("LAYER_INVALID", "Local bytes do not match the descriptor size");
       }
-      try { await upload(id, descriptor, bytes, { signal, plan: plans?.[descriptor.digest] }); }
+      try { await upload(id, descriptor, bytes, { signal, plan }); }
       catch (error) {
         if (![403, 404, 409].includes(error.status)) throw error;
         const current = await status(id, { signal });
@@ -229,12 +252,12 @@ export function createClient({
         return request(artifact.url, { signal });
       }
     },
-    supply,
-    async wait(id, { source, signal, pollMs = 500 } = {}) {
+    supply, pullLayer,
+    async wait(id, { source, pullSource, signal, pollMs = 500 } = {}) {
       for (;;) {
         const current = await status(id, { signal });
         if (terminal.has(current.state)) return current;
-        if (current.required.length) await supply(id, current.required, { source, signal, plans: current.upload_plans });
+        if (current.required.length) await supply(id, current.required, { source, pullSource, signal, plans: current.upload_plans });
         else await slept(pollMs, signal);
       }
     },

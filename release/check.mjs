@@ -34,7 +34,7 @@ function run(command, args, options = {}) {
 try {
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", ...install]);
   run(process.execPath, ["--input-type=module", "-e",
-    'import { createClient } from "@3sln/spool-client"; import { openLayerCache } from "@3sln/spool-client/node"; import { prepareTaskFile } from "@3sln/spool-client/taskfile"; import { start } from "@3sln/spool-runner/node"; import { createRunnerCore, createRunnerHandler } from "@3sln/spool-runner/core"; if (![createClient, openLayerCache, prepareTaskFile, start, createRunnerCore, createRunnerHandler].every(x => typeof x === "function")) process.exitCode=1;',
+    'import { createClient } from "@3sln/spool-client"; import { openLayerCache } from "@3sln/spool-client/node"; import { openS3LayerCache } from "@3sln/spool-client/s3-cache"; import { prepareTaskFile } from "@3sln/spool-client/taskfile"; import { start } from "@3sln/spool-runner/node"; import { createRunnerCore, createRunnerHandler } from "@3sln/spool-runner/core"; if (![createClient, openLayerCache, openS3LayerCache, prepareTaskFile, start, createRunnerCore, createRunnerHandler].every(x => typeof x === "function")) process.exitCode=1;',
   ]);
   const runner = join(scratch, "node_modules", "@3sln", "spool-runner");
   const mcp = join(scratch, "node_modules", "@3sln", "spool-mcp", "bin", "mcp.mjs");

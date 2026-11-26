@@ -64,12 +64,12 @@ function resourceProfiles(limits) {
 }
 
 export function capabilities(auth, execution, limits = LIMITS) {
-  const { resource_profiles, default_resource_profile, artifact_layer_sources, artifact_presigned_get, patch_layers, ...publishedLimits } = limits;
+  const { resource_profiles, default_resource_profile, artifact_layer_sources, artifact_presigned_get, patch_layers, layer_pull, ...publishedLimits } = limits;
   return {
     protocol_versions: ["0.1"], platforms: ["linux/amd64"], bases: [BASE],
     layer_media_types: patch_layers ? [...MEDIA, PATCH_MEDIA] : MEDIA, transports: ["http+sse"],
     features: ["lazy-layers", "cancel", "artifact-download", "cache-retention", "deadline-extension", "live-logs", "task-shards",
-      ...(artifact_layer_sources ? ["artifact-layer-source"] : [])],
+      ...(artifact_layer_sources ? ["artifact-layer-source"] : []), ...(layer_pull ? ["layer-pull"] : [])],
     filesystem: "workspace-oci-tar-subset",
     base_packages: { [BASE.id]: packages },
     logs: { delivery: "live-sse-and-page", encoding: "utf-8", retention_s: limits.history_ttl_seconds ?? LIMITS.history_ttl_seconds },

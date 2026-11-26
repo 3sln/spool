@@ -29,6 +29,7 @@
   "exports": {
     ".": "./client/index.mjs",
     "./node": "./client/node.mjs",
+    "./s3-cache": "./client/s3-cache.mjs",
     "./taskfile": "./client/taskfile.mjs"
   },
   "license": "MIT",

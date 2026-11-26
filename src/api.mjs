@@ -90,6 +90,9 @@ export async function taskEndpoint(request, tenant, service) {
     }
     if (sub === "layers" && digestPattern.test(item ?? "")) {
       if (action === "upload" && method === "POST") return json(await service.uploadOffer(tenant, taskId, item));
+      if (action === "pull" && method === "POST") {
+        return json(await service.pullLayer(tenant, taskId, item, await readJSON(request, 32 * 1024), request.signal));
+      }
       if (action === "complete" && method === "POST") {
         return json(await service.completeUpload(tenant, taskId, item, (await readJSON(request, 64 * 1024))?.parts));
       }

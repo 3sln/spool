@@ -315,6 +315,20 @@ export async function prepareTaskFile(file, {
         addLayer(id, descriptor);
         continue;
       }
+      if (recipe.kind === "cached") {
+        fields(recipe, ["id", "kind", "digest", "media_type"], "cached layer");
+        if (!/^sha256:[a-f0-9]{64}$/u.test(recipe.digest ?? "") || typeof cache.describe !== "function") {
+          throw new TypeError(`Cached layer ${id} requires a SHA-256 digest and a cache that supports digest lookup`);
+        }
+        const found = await cache.describe(recipe.digest, { signal });
+        if (!found || found.digest !== recipe.digest) throw new Error(`Cached layer ${id} is missing: ${recipe.digest}`);
+        const media_type = recipe.media_type ?? found.media_type;
+        validate(found.size, media_type);
+        extra.bytes -= found.size;
+        if (media_type === TAR) expandedTarBytes += found.size;
+        addLayer(id, { digest: recipe.digest, size: found.size, media_type });
+        continue;
+      }
       const plugin = Object.hasOwn(layerBuilders, recipe.kind) ? layerBuilders[recipe.kind] : undefined;
       const buildResources = {};
       if (recipe.build_resources !== undefined) mergeMinimums(buildResources, recipe.build_resources, "build_resources");
@@ -380,6 +394,6 @@ export async function runTaskFile(file, { client, cache, onAccepted, signal, ...
   const prepared = await prepareTaskFile(file, { ...options, client, cache, signal });
   const task = await client.submit(prepared.manifest, { signal });
   await onAccepted?.(task);
-  const outcome = await client.wait(task.task_id, { source: cache.open ?? cache.source, signal });
+  const outcome = await client.wait(task.task_id, { source: cache.open ?? cache.source, pullSource: cache.pullPlan, signal });
   return { ...prepared, task: outcome };
 }

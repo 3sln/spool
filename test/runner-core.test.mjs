@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { createClient, layerDescriptor } from "../client/index.mjs";
 import { BASE, Fault, createRunnerCore, sha256 } from "../src/core.mjs";
 
-function fixture() {
+function fixture(options) {
   const state = new Map();
   const blobs = new Map();
   const outputs = new Map();
@@ -31,6 +31,12 @@ function fixture() {
       get: (key) => blobs.get(key),
       put: (key, bytes) => blobs.set(key, bytes),
       delete: (key) => blobs.delete(key),
+      async putVerified(key, request, descriptor) {
+        const bytes = new Uint8Array(await new Response(request.body).arrayBuffer());
+        assert.equal(bytes.length, descriptor.size);
+        assert.equal(await sha256(bytes), descriptor.digest);
+        blobs.set(key, bytes);
+      },
     },
     artifacts: {
       open: (key) => outputs.get(key),
@@ -44,10 +50,11 @@ function fixture() {
     },
     limits: { max_logs_bytes: 4, history_ttl_seconds: 600, max_active_tasks_per_tenant: 1 },
     stop: (id, claim) => stopped.push({ id, claim }),
+    ...options,
   });
   const client = createClient({ url: "https://custom.test", headers: { authorization: "Bearer fixture" },
     fetch: (url, options) => runner.fetch(new Request(url, options)) });
-  return { ...runner, client, stopped, execution };
+  return { ...runner, client, stopped, execution, state, blobs };
 }
 
 function manifest(requestId, layers = []) {
@@ -58,6 +65,46 @@ function manifest(requestId, layers = []) {
     network: { mode: "none" }, outputs: { paths: ["/workspace/result"] },
   };
 }
+
+test("pull plans fetch only from configured origins and admit only verified bytes", async () => {
+  const input = Uint8Array.of(1, 2, 3);
+  const layer = await layerDescriptor(input);
+  const seen = [];
+  const { client, state, blobs } = fixture({
+    layerPullOrigins: ["https://objects.example"],
+    pullFetch(url, request) {
+      seen.push({ url, request });
+      if (url.pathname === "/redirect") return Response.redirect("https://other.example");
+      if (url.pathname === "/bad") return new Response(Uint8Array.of(1, 2, 4));
+      if (url.pathname === "/large") return new Response(Uint8Array.of(1, 2, 3, 4));
+      return new Response(input);
+    },
+  });
+  assert.ok((await client.capabilities()).features.includes("layer-pull"));
+  const { task_id: id, required, upload_plans: plans } = await client.submit(manifest("pull", [layer]));
+  assert.match(plans[layer.digest].pull_url, /\/pull$/);
+  const send = (download) => client.pullLayer(id, layer.digest, download);
+  await assert.rejects(send("https://objects.example.evil.test/layer"), { code: "LAYER_PULL_ORIGIN" });
+  await assert.rejects(send({ url: "https://objects.example/good", headers: { Host: "evil.test" } }), { status: 400 });
+  await assert.rejects(send({ url: "https://objects.example/good", expires_at: "2020-01-01T00:00:00Z" }), { code: "LAYER_PULL_EXPIRED" });
+  assert.equal(seen.length, 0);
+  await assert.rejects(send("https://objects.example/redirect"), { code: "LAYER_PULL_FAILED" });
+  await assert.rejects(send("https://objects.example/bad"), { code: "LAYER_INVALID" });
+  await assert.rejects(send("https://objects.example/large"), { code: "LAYER_INVALID" });
+  assert.equal(seen.length, 3);
+  assert.equal(blobs.size, 0);
+  assert.deepEqual((await client.status(id)).required, [layer]);
+  const download = { url: "https://objects.example/good?signature=secret-query", headers: { authorization: "Bearer secret-source" } };
+  await Promise.all([client.supply(id, required, { plans, pullSource: () => download }), send(download)]);
+  assert.equal(seen.length, 4);
+  assert.equal(seen.at(-1).request.headers.get("authorization"), "Bearer secret-source");
+  assert.equal(seen.at(-1).request.redirect, "manual");
+  assert.equal(seen.at(-1).request.credentials, "omit");
+  assert.doesNotMatch(JSON.stringify([...state]), /secret-|objects\.example/);
+  assert.equal((await client.status(id)).state, "QUEUED");
+  await client.cancel(id);
+  assert.equal((await client.submit(manifest("pull-reuse", [layer]))).required.length, 0);
+});
 
 test("the core uses custom persistence, content, execution and discovery providers", async () => {
   const { client, fetch, service, execution } = fixture();

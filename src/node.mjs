@@ -14,6 +14,7 @@ import { connectQueue } from "./jetstream.mjs";
 import { TaskService } from "./service.mjs";
 import { openData } from "./sqlite.mjs";
 import { fileBlobs } from "./file-blobs.mjs";
+import { configuredLayerPull } from "./layer-pull.mjs";
 
 export function nodeHandler(service, auth, { origins = [], workerAuth, execution = EXECUTION } = {}) {
   const publicAPI = createRunnerHandler({
@@ -63,6 +64,8 @@ export async function start(env = process.env, overrides = {}) {
   limits.artifact_layer_sources = true;
   limits.patch_layers = overrides.executor === undefined;
   limits.artifact_presigned_get = Boolean(objectStorage);
+  const layerPull = configuredLayerPull(env);
+  limits.layer_pull = layerPull.origins.size > 0;
   const workers = Number(env.SPOOL_CONCURRENCY ?? 1);
   const port = Number(env.PORT ?? 8787);
   if (!Number.isInteger(workers) || workers < 1 || workers > 64) throw new Error("Invalid SPOOL_CONCURRENCY");
@@ -86,7 +89,7 @@ export async function start(env = process.env, overrides = {}) {
     },
   } : localBlobs;
   const service = new TaskService(data.store, objectStorage?.blobs ?? localBlobs, {
-    concurrency: workers, limits, transfers: objectStorage?.transfers, artifactStorage: artifacts,
+    concurrency: workers, limits, transfers: objectStorage?.transfers, artifactStorage: artifacts, layerPull,
   });
   const handler = nodeHandler(service, auth, {
     origins: env.SPOOL_ALLOWED_ORIGINS?.split(",") ?? [], workerAuth, execution: overrides.execution,
