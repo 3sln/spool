@@ -44,7 +44,10 @@ try {
   await cp("LICENSE", join(scratch, "LICENSE"));
   const archive = join(destination, cliArchiveName(pkg.version, platform));
   if (windows) {
-    run("tar", ["-a", "-cf", archive, name, "LICENSE"], { cwd: scratch });
+    run("pwsh", ["-NoProfile", "-NonInteractive", "-Command",
+      "Compress-Archive -LiteralPath 'spool-mcp.exe','LICENSE' -DestinationPath $env:SPOOL_RELEASE_ARCHIVE -Force"], {
+      cwd: scratch, env: { ...process.env, SPOOL_RELEASE_ARCHIVE: archive },
+    });
   } else {
     run("tar", ["-czf", archive, name, "LICENSE"], { cwd: scratch });
   }
