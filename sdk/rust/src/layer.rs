@@ -1,10 +1,12 @@
 use super::{Descriptor, Error, Result};
+use crate::cache_leases::{self, Lease, transaction};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 pub const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
@@ -73,7 +75,15 @@ pub fn describe(bytes: &[u8], media_type: &str) -> Result<Descriptor> {
 
 pub struct LayerCache {
     directory: PathBuf,
+    lease: Option<Lease>,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CacheGc {
+    pub removed_layers: Vec<String>,
+    pub removed_leases: usize,
+}
+
 impl LayerCache {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -86,7 +96,50 @@ impl LayerCache {
         }
         builder.create(path)?;
         Ok(Self {
-            directory: path.to_owned(),
+            directory: cache_leases::canonical_path(path)?,
+            lease: None,
+        })
+    }
+
+    /// Bind cached layers to a marker file in this workspace.
+    pub fn for_workspace(&self, workspace: impl AsRef<Path>, ttl: Duration) -> Result<Self> {
+        Ok(Self {
+            directory: self.directory.clone(),
+            lease: Some(Lease::new(&self.directory, workspace.as_ref(), ttl)?),
+        })
+    }
+
+    pub fn lease_path(&self) -> Option<&Path> {
+        self.lease.as_ref().map(|lease| lease.path.as_path())
+    }
+
+    fn lease(&self) -> Result<&Lease> {
+        self.lease
+            .as_ref()
+            .ok_or(Error::Invalid("A workspace lease is required"))
+    }
+
+    pub fn renew(&self) -> Result<usize> {
+        let lease = self.lease()?;
+        transaction(&self.directory, |db| lease.renew(db))
+    }
+
+    pub fn release(&self) -> Result<usize> {
+        let lease = self.lease()?;
+        transaction(&self.directory, |db| lease.release(db))
+    }
+
+    pub fn retain(&self, digest: &str) -> Result<bool> {
+        let lease = self.lease()?;
+        let path = self.path(digest)?;
+        transaction(&self.directory, |db| {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() => lease.retain(db, digest)?,
+                Ok(_) => return Ok(false),
+                Err(error) if cache_leases::missing(&error) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+            Ok(true)
         })
     }
 
@@ -112,9 +165,15 @@ impl LayerCache {
         let mut tempfile = tempfile::NamedTempFile::new_in(&self.directory)?;
         tempfile.write_all(bytes)?;
         tempfile.as_file().sync_all()?;
-        tempfile
-            .persist(self.path(&descriptor.digest)?)
-            .map_err(|error| error.error)?;
+        transaction(&self.directory, |db| {
+            if let Some(lease) = &self.lease {
+                lease.retain(db, &descriptor.digest)?;
+            }
+            tempfile
+                .persist(self.path(&descriptor.digest)?)
+                .map_err(|error| error.error)?;
+            Ok(())
+        })?;
         Ok(descriptor)
     }
 
@@ -123,6 +182,9 @@ impl LayerCache {
             return Err(Error::Invalid("Layer exceeds cache limit"));
         }
         let path = self.path(&descriptor.digest)?;
+        if self.lease.is_some() && !self.retain(&descriptor.digest)? {
+            return Err(io::Error::from(io::ErrorKind::NotFound).into());
+        }
         if !fs::symlink_metadata(&path)?.is_file() {
             return Err(Error::Invalid("Expected a regular cached layer file"));
         }
@@ -137,10 +199,45 @@ impl LayerCache {
     }
 
     pub fn delete(&self, digest: &str) -> Result<()> {
-        match fs::remove_file(self.path(digest)?) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        let path = self.path(digest)?;
+        transaction(&self.directory, |db| {
+            if cache_leases::active(db)?.0.contains(digest) {
+                return Err(Error::Invalid("Layer has an active lease"));
+            }
+            Self::remove(path)
+        })
+    }
+
+    fn remove(path: PathBuf) -> Result<()> {
+        match fs::remove_file(path) {
+            Err(error) if cache_leases::missing(&error) => Ok(()),
             result => Ok(result?),
         }
+    }
+
+    pub fn gc(&self) -> Result<CacheGc> {
+        transaction(&self.directory, |db| {
+            let (retained, removed_leases) = cache_leases::active(db)?;
+            let mut removed_layers = Vec::new();
+            for entry in fs::read_dir(&self.directory)? {
+                let entry = entry?;
+                let Some(name) = entry.file_name().into_string().ok() else {
+                    continue;
+                };
+                let digest = format!("sha256:{name}");
+                if let Ok(path) = self.path(&digest)
+                    && !retained.contains(&digest)
+                {
+                    Self::remove(path)?;
+                    removed_layers.push(digest);
+                }
+            }
+            removed_layers.sort();
+            Ok(CacheGc {
+                removed_layers,
+                removed_leases,
+            })
+        })
     }
 }
 
@@ -281,5 +378,29 @@ mod tests {
             descriptor.digest,
             "sha256:5ea94316a89ba0fb13bc2a22ad34cb710489a08f39c33d62d7dd8111a7e69cc4"
         );
+    }
+
+    #[test]
+    fn workspace_markers_fence_collection_until_return_or_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = LayerCache::open(directory.path().join("cache")).unwrap();
+        let alpha = tempfile::tempdir_in(directory.path()).unwrap();
+        let beta = tempfile::tempdir_in(directory.path()).unwrap();
+        let a = cache
+            .for_workspace(alpha.path(), crate::DEFAULT_LEASE_TTL)
+            .unwrap();
+        let b = cache
+            .for_workspace(beta.path(), crate::DEFAULT_LEASE_TTL)
+            .unwrap();
+        let shared = a.put(b"shared", TAR).unwrap();
+        let unleased = cache.put(b"no workspace", TAR).unwrap();
+        assert!(b.retain(&shared.digest).unwrap());
+        assert_eq!(a.renew().unwrap(), 1);
+        assert_eq!(cache.gc().unwrap().removed_layers, [unleased.digest]);
+        fs::remove_file(a.lease_path().unwrap()).unwrap();
+        assert_eq!(cache.gc().unwrap().removed_leases, 1);
+        assert!(cache.delete(&shared.digest).is_err());
+        assert_eq!(b.release().unwrap(), 1);
+        assert_eq!(cache.gc().unwrap().removed_layers, [shared.digest]);
     }
 }

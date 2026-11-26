@@ -122,6 +122,8 @@ test("lazy layers, idempotency, tenant isolation, replay, artifacts and cache ev
   conflict.command.argv = ["true"];
   assert.equal((await request(handler, "/v1/tasks", { method: "POST", body: conflict })).status, 409);
   assert.equal((await request(handler, initial.links.self, { user: null })).status, 401);
+  assert.equal((await request(handler, "/v1/auth/check", { user: null })).status, 401);
+  assert.equal((await request(handler, "/v1/auth/check")).status, 204);
   assert.equal((await request(handler, initial.links.self, { user: "bob" })).status, 404);
   assert.notEqual((await submit(handler, spec, "bob")).task_id, initial.task_id);
 

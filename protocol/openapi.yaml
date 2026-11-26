@@ -10,6 +10,22 @@ paths:
         '200':
           description: Platforms, bases, resource limits, authentication and transports.
           content: { application/json: { schema: { type: object } } }
+  /.well-known/oauth-protected-resource:
+    get:
+      operationId: oauthProtectedResource
+      security: []
+      responses:
+        '200':
+          description: RFC 9728 resource and authorization-server metadata for OAuth deployments.
+          content: { application/json: { schema: { type: object } } }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/auth/check:
+    get:
+      operationId: checkAuthentication
+      responses:
+        '204':
+          description: The supplied credential authenticated successfully.
+        default: { $ref: '#/components/responses/Error' }
   /v1/tasks:
     post:
       operationId: submitTask

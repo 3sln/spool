@@ -32,6 +32,12 @@
                 :task (tooling/worker-check)}
   client-emit {:doc "Regenerate JavaScript and Rust client replay code with Kin"
                :task (tooling/emit-client *command-line-args*)}
+  version {:doc "Read the release version from version.edn" :override-builtin true
+           :task (println (tooling/release-version (first *command-line-args*)))}
+  stamp {:doc "Apply the release version to manifests and lockfiles in this checkout"
+         :task (shell "node" "release/stamp.mjs" (tooling/release-version nil))}
+  release-cli {:doc "Build and smoke-test the standalone MCP binary for this platform"
+               :task (apply shell "node" "release/binary.mjs" *command-line-args*)}
   release-pack {:doc "Assemble npm packages and write the release checksums"
                 :task (apply shell "node" "release/package.mjs" *command-line-args*)}
   release-check {:doc "Verify release checksums and install into a clean consumer"

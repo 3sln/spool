@@ -1,9 +1,13 @@
 //! A blocking client for the Spool 0.1 HTTP binding.
+mod cache_leases;
 mod layer;
 #[allow(clippy::needless_return)]
 mod replay;
 
-pub use layer::{Entry, LayerCache, TAR, TAR_GZIP, build_layer, describe, describe_reader};
+pub use cache_leases::DEFAULT_LEASE_TTL;
+pub use layer::{
+    CacheGc, Entry, LayerCache, TAR, TAR_GZIP, build_layer, describe, describe_reader,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -59,6 +63,11 @@ impl StdError for Error {}
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+impl From<rusqlite::Error> for Error {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Io(std::io::Error::other(value))
     }
 }
 impl From<ureq::Error> for Error {

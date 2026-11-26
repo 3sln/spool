@@ -113,6 +113,7 @@ export async function prepareTaskFile(file, {
   if (!cache || typeof cache.put !== "function") throw new TypeError("A writable layer cache is required");
   if (!string(requestId) || !/^[A-Za-z0-9._:-]{1,128}$/u.test(requestId)) throw new TypeError("Invalid task request ID");
   const root = await realpath(contextRoot);
+  if (!cache.leasePath && typeof cache.forWorkspace === "function") cache = await cache.forWorkspace(root);
   const entry = await scopedPath(root, root, relative(resolve(contextRoot), resolve(file)));
   const required = { features: new Set(), limits: new Map() };
   const done = new Set();
@@ -249,6 +250,9 @@ export async function prepareTaskFile(file, {
 
 export async function runTaskFile(file, { client, cache, onAccepted, signal, ...options } = {}) {
   if (!client || typeof cache?.source !== "function") throw new TypeError("A runner client and readable layer cache are required");
+  if (!cache.leasePath && typeof cache.forWorkspace === "function") {
+    cache = await cache.forWorkspace(options.contextRoot ?? dirname(resolve(file)));
+  }
   const prepared = await prepareTaskFile(file, { ...options, client, cache, signal });
   const task = await client.submit(prepared.manifest, { signal });
   await onAccepted?.(task);

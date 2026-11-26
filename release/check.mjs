@@ -4,10 +4,11 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { cliArchiveName, cliPlatforms } from "./platforms.mjs";
 
 const dist = resolve(process.argv[2] ?? "dist");
 const { version, entries } = JSON.parse(await readFile(join(dist, "artifacts.json"), "utf8"));
-const names = new Set(["@3sln/spool", "@3sln/spool-runner", "@3sln/spool-mcp"]);
+const names = new Set(["@3sln/spool-client", "@3sln/spool-runner", "@3sln/spool-mcp"]);
 const install = [];
 for (const entry of entries) {
   assert.equal(createHash("sha256").update(await readFile(join(dist, entry.file))).digest("hex"), entry.sha256);
@@ -17,6 +18,12 @@ for (const entry of entries) {
   install.push(join(dist, entry.file));
 }
 assert.equal(names.size, 0);
+if (process.env.SPOOL_REQUIRE_CLI_BINARIES === "1") {
+  for (const platform of cliPlatforms) {
+    const file = cliArchiveName(version, platform);
+    assert.ok(entries.some((entry) => entry.file === file && !entry.package), `Missing release binary ${file}`);
+  }
+}
 const scratch = await mkdtemp(join(tmpdir(), "spool-consumer-"));
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { cwd: scratch, stdio: "pipe", encoding: "utf8", ...options });
@@ -27,12 +34,24 @@ function run(command, args, options = {}) {
 try {
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", ...install]);
   run(process.execPath, ["--input-type=module", "-e",
-    'import { createClient } from "@3sln/spool"; import { openLayerCache } from "@3sln/spool/node"; import { prepareTaskFile } from "@3sln/spool/taskfile"; import { start } from "@3sln/spool-runner/node"; if (![createClient, openLayerCache, prepareTaskFile, start].every(x => typeof x === "function")) process.exitCode=1;',
+    'import { createClient } from "@3sln/spool-client"; import { openLayerCache } from "@3sln/spool-client/node"; import { prepareTaskFile } from "@3sln/spool-client/taskfile"; import { start } from "@3sln/spool-runner/node"; if (![createClient, openLayerCache, prepareTaskFile, start].every(x => typeof x === "function")) process.exitCode=1;',
   ]);
   const runner = join(scratch, "node_modules", "@3sln", "spool-runner");
   const mcp = join(scratch, "node_modules", "@3sln", "spool-mcp", "bin", "mcp.mjs");
   assert.equal(run(process.execPath, [join(runner, "bin", "runner.mjs"), "--version"]).trim(), version);
   assert.equal(run(process.execPath, [mcp, "--version"]).trim(), version);
+  const globalPrefix = join(scratch, "global");
+  const cli = entries.find((entry) => entry.package === "@3sln/spool-mcp");
+  run("npm", ["install", "--global", "--prefix", globalPrefix, "--ignore-scripts", "--no-audit", "--no-fund", join(dist, cli.file)]);
+  if (process.platform !== "win32") {
+    assert.equal(run(join(globalPrefix, "bin", "spool-mcp"), ["--version"]).trim(), version);
+  }
+  assert.deepEqual(JSON.parse(run(process.execPath, [mcp, "auth", "list"], {
+    env: { ...process.env, SPOOL_AUTH_DIR: join(scratch, "auth") },
+  })), []);
+  assert.deepEqual(JSON.parse(run(process.execPath, [mcp, "cache-gc", "--state-dir", join(scratch, "cache")], {
+    env: { ...process.env, SPOOL_STATE_MODE: "custom", SPOOL_BLOB_DIR: "" },
+  })), { removedLayers: [], removedLeases: 0 });
   assert.ok((await stat(join(runner, "guest", "Dockerfile"))).isFile());
   assert.ok(!(await readdir(runner)).some((name) => /^wrangler\./u.test(name)));
   const esbuild = process.env.SPOOL_ESBUILD ?? (process.env.SPOOL_TOOL_MODULES

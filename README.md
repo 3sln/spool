@@ -4,20 +4,23 @@ Spool runs the same portable task manifest on Cloudflare Containers and self-hos
 
 ## Install from release artifacts
 
+Install the MCP CLI with `npm install -g @3sln/spool-mcp`. It exposes the
+`spool-mcp` command. The GitHub archives contain standalone executables for
+Linux, macOS, and Windows on x64 and ARM64.
+
 Each release builds these assets together and records their SHA-256 checksums.
 
 | Artifact | Contents |
 | --- | --- |
-| `3sln-spool-<version>.tgz` | Fetch SDK, Node/Bun layer cache, and JSON Taskfile builder |
+| `3sln-spool-client-<version>.tgz` | Fetch SDK, Node/Bun layer cache, and JSON Taskfile builder |
 | `spool-client-<version>.crate` | Native Rust SDK, deterministic layer builder, and local cache |
 | `3sln-spool-runner-<version>.tgz` | Self-hosted `spool-runner` CLI, runner library, Cloudflare Worker, and guest recipe |
-| `3sln-spool-mcp-<version>.tgz` | Standalone `spool-mcp` CLI for stdio MCP |
-| `spool-guest-<version>-linux-amd64.tar.gz` | Prebuilt OCI guest image for a compatible engine |
+| `3sln-spool-mcp-<version>.tgz` | Node-based `spool-mcp` CLI for stdio MCP |
+| `spool-mcp-<version>-<platform>.tar.gz` or `.zip` | Standalone `spool-mcp` executable |
 
 Install npm tarballs with `npm install ./<file>.tgz`; add `-g` to put the CLIs
 on your PATH. Unpack the Rust crate and use a Cargo path dependency for local
-installation. To use the prebuilt guest, run `docker load -i <image>.tar.gz`.
-The runner can also build the guest with `spool-runner guest-build`.
+installation. Build the runner's OCI guest with `spool-runner guest-build`.
 
 ## Self-hosted
 
@@ -56,13 +59,13 @@ OAuth mode publishes protected-resource metadata. Token issuance, client registr
 
 ## Client libraries
 
-Import `@3sln/spool` for the Fetch-based client and byte-level OCI layer builder. Import `@3sln/spool/node` for the Node or Bun filesystem cache and directory builder. The `include` callback can exclude local files before packaging, including entire directories.
+Import `@3sln/spool-client` for the Fetch-based client and byte-level OCI layer builder. Import `@3sln/spool-client/node` for the Node or Bun filesystem cache and directory builder. The `include` callback can exclude local files before packaging, including entire directories.
 
 ```js
-import { createClient } from "@3sln/spool";
-import { buildDirectoryLayer, openLayerCache } from "@3sln/spool/node";
+import { createClient } from "@3sln/spool-client";
+import { buildDirectoryLayer, openLayerCache } from "@3sln/spool-client/node";
 
-const cache = await openLayerCache("./prepared-layers");
+const cache = await openLayerCache("./prepared-layers", { workspace: "./prepared-workspace" });
 const client = createClient({
   url: "https://runner.example.com",
   headers: () => ({ Authorization: `Bearer ${process.env.SPOOL_TOKEN}` }),
@@ -85,7 +88,13 @@ const task = await client.submit({
 const outcome = await client.wait(task.task_id);
 ```
 
-Pass `previous` to build a directory delta against a prior snapshot. Reproducible tar layers use normalized ownership, timestamps, and executable modes. The byte builder also accepts explicit directory, file, whiteout, and opaque entries. For large prepared archives use `cache.importFile(path, mediaType)` and `layerSource: cache.open` to upload from disk. Prepare toolchains and dependencies in a compatible build environment before packaging them. Keep exact cached bytes while any task may reference them. The cache verifies reads against the manifest descriptor and exposes explicit list and delete operations.
+Pass `previous` to build a directory delta against a prior snapshot. Reproducible tar layers use normalized ownership, timestamps, and executable modes. The byte builder also accepts explicit directory, file, whiteout, and opaque entries. For large prepared archives use `cache.importFile(path, mediaType)` and `layerSource: cache.open` to upload from disk. Prepare toolchains and dependencies in a compatible build environment before packaging them. The cache verifies reads against the manifest descriptor.
+
+### Client layer leases
+
+Bind a cache to a workspace with `openLayerCache(path, { workspace })` or `await cache.forWorkspace(workspace)`. Taskfile builds and MCP with a workspace do this automatically. The first use writes a marker under `.spool-leases/` in the workspace and records its absolute path, identity, and each layer's expiry in the shared cache. Put, import, and reads through that workspace refresh the touched layer for seven days by default. Use `leaseTtlMs` on open or `{ ttlMs }` on `forWorkspace` to change the duration. The marker directory is skipped in layer snapshots and belongs in your project's ignore file.
+
+`cache.retain(digest)` claims an existing layer. `cache.renew()` extends the workspace's still-valid references. `cache.release()` returns all its references to that cache and removes its marker. Deleting or moving the workspace also invalidates its references. `cache.gc()` removes a layer once every workspace reference has expired, been returned, or lost its marker. A cache opened without a workspace can run GC and inspect layers. Existing unleased content is eligible for collection, so bind existing projects and retain any contents they still need before the first GC.
 
 For presigned transfers, pass an `allowTransferURL` callback that accepts the configured object storage origin. The SDK omits runner credentials from presigned requests. A browser client also needs bucket CORS to allow its origin and PUT requests and to expose the response `ETag`.
 
@@ -100,7 +109,7 @@ Check in [a task](examples/taskfiles/check.json), [a reusable base](examples/tas
 Call the library to resolve runner capabilities, build the ordered layers, and merge their SHA-256 descriptors into the manifest.
 
 ```js
-import { runTaskFile } from "@3sln/spool/taskfile";
+import { runTaskFile } from "@3sln/spool-client/taskfile";
 
 const { task } = await runTaskFile("./examples/taskfiles/check.json", {
   client, cache,
@@ -126,9 +135,9 @@ spool-mcp init --runner http://127.0.0.1:8787 --workspace .
 The default writes `.mcp.json`. Use `--client cursor` for `.cursor/mcp.json`,
 `--config PATH` for a custom JSON config, or `--dry-run` to see the proposed
 server entry. Existing entries are preserved. Use `--force` to replace a
-conflicting Spool entry. Configure `SPOOL_TOKEN` or the Access service
-credentials in the MCP host environment. The generated config contains the
-runner origin and startup arguments.
+conflicting Spool entry. Configure a local authentication profile or pass
+`SPOOL_TOKEN` in the MCP host environment. The generated config contains
+startup arguments and may name a profile.
 Set `SPOOL_TRANSFER_ORIGINS` to a comma-separated list of allowed HTTPS storage origins for direct uploads.
 
 Shared mode uses a per-user local disk cache so separate stdio processes share
@@ -138,10 +147,48 @@ specified directory. `SPOOL_STATE_DIR` and `SPOOL_STATE_MODE` work for
 hosts that configure the adapter through environment variables. Task state
 and event cursors are served by the runner.
 
+With a workspace configured, `renew_cache_lease` and `release_cache_lease`
+manage its current references. Set `SPOOL_CACHE_LEASE_SECONDS` to override the
+default duration. Run `spool-mcp cache-gc` or call `gc_layer_cache` to reclaim
+unleased layers. Pass `--state-dir PATH` to the command for a custom cache.
+
 `submit_template` compiles a checked-in Taskfile under the workspace root.
 Call `wait_task` to satisfy layer requests from disk. Call `task_status` and
 `task_events` to inspect progress, then `extend_task` to request a later deadline. Use
 `task_artifacts` and `read_artifact` to retrieve results up to 512 KiB through MCP. Use a client library for larger files.
+
+### Authentication profiles
+
+Use a separate profile name for each runner or identity. `spool-mcp auth list`
+shows runner origins, schemes and expiry. `spool-mcp auth logout --profile NAME`
+removes the local profile. `spool-mcp init --profile NAME --workspace .` selects it
+for a project, or use `SPOOL_PROFILE` in the MCP host. Credentials live in
+private per-user files under the Spool state home. `SPOOL_AUTH_DIR` overrides
+that location independently of the layer cache.
+
+```sh
+spool-mcp auth login --profile team --runner https://runner.example.net --client-id YOUR_PUBLIC_CLIENT_ID
+spool-mcp init --profile team --workspace .
+```
+
+OAuth login uses the runner's protected-resource metadata to discover its issuer.
+It uses device authorization when advertised or a browser code flow with S256
+PKCE. Register a public client with the issuer. For browser login, register the
+`http://127.0.0.1:<port>/oauth/callback` redirect. Set `--redirect-port` for an issuer
+that requires a fixed port. Select `--issuer` when the runner advertises several.
+The CLI refreshes expiring credentials when the issuer supplies a refresh token.
+
+For a personal Worker using the bearer-token adapter, provision the same random
+token as a Worker secret and in the local CLI. Run these commands when that
+Worker is ready to use.
+
+```sh
+token=$(openssl rand -hex 32)
+printf '%s' "$token" | wrangler secret put SPOOL_TOKEN --name YOUR_WORKER
+printf '%s' "$token" | spool-mcp auth login --profile personal --runner https://YOUR_RUNNER --scheme bearer --token-stdin
+unset token
+spool-mcp init --profile personal --workspace .
+```
 
 ## Cloudflare preview
 
@@ -193,4 +240,6 @@ Across hosts, use HTTPS for coordinator calls, a private authenticated TLS conne
 
 Install Babashka and run `bb tasks` for development commands. Run `npm ci` to install dependencies, `bb test` for JavaScript and native guest tests, `bb test-rust` for the Rust SDK, and `bb test-oci` with a working Docker engine for the integration suite. Set `SPOOL_TEST_RUST=1` to include the Rust client against the same runner. The GitHub verification workflow also runs the Worker fixture, the JetStream worker pool, and tarball installation in a clean consumer.
 
-Run `SPOOL_RELEASE_OCI=1 bb release-build` to prepare and verify the complete release assets in `dist/`. The GitHub release workflow builds CI artifacts and can stage a draft prerelease from main. See [development status](DEVLOG.md), [security scope](SECURITY.md), and the [MIT license](LICENSE).
+Use `bb release-pack` for npm tarballs and `bb release-cli` for a standalone executable archive on the current platform. `SPOOL_RELEASE_CLI=1 bb release-build` verifies the local bundle in `dist/`. To include a locally built OCI guest image, also set `SPOOL_RELEASE_OCI=1`.
+
+A version bump in `version.edn` on main builds and verifies all six executables, publishes `@3sln/spool-mcp` through npm trusted publishing, and attaches the assets to the matching GitHub release. Prereleases use npm's `next` tag. The npm client SDK and runner tarballs are GitHub release assets. See [release bootstrap](release/README.md), [development status](DEVLOG.md), [security scope](SECURITY.md), and the [MIT license](LICENSE).

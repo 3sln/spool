@@ -8,6 +8,7 @@ import { openLayerCache } from "../client/node.mjs";
 import { prepareTaskFile } from "../client/taskfile.mjs";
 import pkg from "../package.json" with { type: "json" };
 import { cliState, initializeCli, parseCli, usage } from "./mcp-config.mjs";
+import { authCommand, runnerConnection } from "./mcp-auth.mjs";
 
 async function serve(options, env) {
   const state = await cliState(options, env);
@@ -18,23 +19,16 @@ async function serve(options, env) {
   const input = process.stdin;
   const closeInput = () => input.destroy();
   lifecycle.signal.addEventListener("abort", closeInput, { once: true });
+  let cache;
   try {
-    const cache = await openLayerCache(state.blobs);
     const workspacePathOption = options.workspace ?? env.SPOOL_WORKSPACE_ROOT;
     const workspace = workspacePathOption && await realpath(workspacePathOption);
+    const leaseTtlMs = env.SPOOL_CACHE_LEASE_SECONDS === undefined ? undefined : Number(env.SPOOL_CACHE_LEASE_SECONDS) * 1000;
+    cache = await openLayerCache(state.blobs, { workspace: workspace || undefined, leaseTtlMs });
     const client = createClient({
-      url: options.runner ?? env.SPOOL_URL ?? "http://127.0.0.1:8787",
+      ...await runnerConnection(options, env),
       allowTransferURL: (url) => (env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((item) => item.trim()).includes(url.origin),
       layerSource: cache.open,
-      headers() {
-        const headers = {};
-        if (env.SPOOL_TOKEN) headers.authorization = `Bearer ${env.SPOOL_TOKEN}`;
-        if (env.SPOOL_ACCESS_CLIENT_ID && env.SPOOL_ACCESS_CLIENT_SECRET) {
-          headers["cf-access-client-id"] = env.SPOOL_ACCESS_CLIENT_ID;
-          headers["cf-access-client-secret"] = env.SPOOL_ACCESS_CLIENT_SECRET;
-        }
-        return headers;
-      },
     });
 
     async function workspacePath(path) {
@@ -53,6 +47,9 @@ async function serve(options, env) {
     const idArgs = fields({ task_id: id });
     const tools = {
       capabilities: ["Discover available platforms, bases and limits", fields({}), () => client.capabilities()],
+      gc_layer_cache: ["Remove layers without an active workspace lease", fields({}), (_args, signal) => cache.gc({ signal })],
+      renew_cache_lease: ["Renew the workspace's unexpired layer leases", fields({}), async () => ({ renewed: await cache.renew() })],
+      release_cache_lease: ["Return the workspace's layer leases", fields({}), async () => ({ released: await cache.release() })],
       build_layer: ["Build and cache a workspace snapshot or directory delta", fields(
         { directory: id, previous: id }, ["directory"],
       ), async ({ directory, previous }, signal) => cache.buildDirectory(
@@ -116,6 +113,8 @@ async function serve(options, env) {
     if (!workspace) {
       delete tools.build_layer;
       delete tools.submit_template;
+      delete tools.renew_cache_lease;
+      delete tools.release_cache_lease;
     }
 
     const info = { name: "spool-mcp", version: pkg.version };
@@ -187,7 +186,8 @@ async function serve(options, env) {
   } finally {
     await Promise.allSettled([...pending.values()].map(({ done }) => done));
     for (const signal of ["SIGINT", "SIGTERM"]) process.removeListener(signal, stop);
-    await state.close();
+    try { if (state.isolated) await cache?.release?.(); }
+    finally { await state.close(); }
   }
 }
 
@@ -227,6 +227,13 @@ try {
     case "help": console.log(usage); break;
     case "version": console.log(pkg.version); break;
     case "init": console.log(JSON.stringify(await initializeCli(options), null, 2)); break;
+    case "auth": console.log(JSON.stringify(await authCommand(options, process.env), null, 2)); break;
+    case "cache-gc": {
+      const state = await cliState(options, process.env);
+      try { console.log(JSON.stringify(await (await openLayerCache(state.blobs)).gc())); }
+      finally { await state.close(); }
+      break;
+    }
     default: await serve(options, process.env);
   }
 } catch (error) {

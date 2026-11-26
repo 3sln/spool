@@ -115,7 +115,7 @@ test("identical Taskfile prefixes share one build across separate processes", { 
   assert.equal((await readdir(join(root, "cache", ".builds"))).length, 4);
 
   const cache = await openLayerCache(join(root, "cache"));
-  await cache.delete(layers(a)[1].descriptor.digest);
+  await cache.delete(layers(a)[1].descriptor.digest, { force: true });
   const rebuilt = child(script, [join(root, "alpha"), root]);
   workers.push(rebuilt);
   assert.equal((await rebuilt.status).code, 0);

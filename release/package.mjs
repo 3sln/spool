@@ -4,6 +4,7 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { cliArchiveName, cliPlatforms } from "./platforms.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const source = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
@@ -14,11 +15,11 @@ const packageInfo = {
   repository: { type: "git", url: "git+https://github.com/3sln/spool.git" },
 };
 const clientFiles = [
-  "client/index.mjs", "client/build-cache.mjs", "client/layers.mjs", "client/node.mjs", "client/taskfile.mjs", "client/generated/js",
+  "client/index.mjs", "client/build-cache.mjs", "client/cache-leases.mjs", "client/layers.mjs", "client/node.mjs", "client/taskfile.mjs", "client/generated/js",
 ];
 const packages = [
   {
-    manifest: { name: "@3sln/spool", description: "Client SDK and layer builders for the Spool task protocol", exports: source.exports },
+    manifest: { name: "@3sln/spool-client", description: "Client SDK and layer builders for the Spool task protocol", exports: source.exports },
     files: clientFiles,
   },
   {
@@ -35,8 +36,11 @@ const packages = [
     files: ["src", "guest/Dockerfile", "guest/Cargo.toml", "guest/Cargo.lock", "guest/src", "guest/.dockerignore", "bin/runner.mjs"],
   },
   {
-    manifest: { name: "@3sln/spool-mcp", description: "Stdio MCP client for Spool runners", bin: { "spool-mcp": "./bin/mcp.mjs" } },
-    files: [...clientFiles, "bin/mcp.mjs", "bin/mcp-config.mjs"],
+    manifest: {
+      name: "@3sln/spool-mcp", description: "Stdio MCP client for Spool runners",
+      bin: { "spool-mcp": "./bin/mcp.mjs" }, publishConfig: { access: "public", registry: "https://registry.npmjs.org" },
+    },
+    files: [...clientFiles, "bin/mcp.mjs", "bin/mcp-config.mjs", "bin/mcp-auth.mjs", "bin/oauth.mjs"],
   },
 ];
 
@@ -63,10 +67,13 @@ try {
     console.log(packed[0].filename);
   }
   const version = source.version;
-  const escaped = version.replaceAll(".", "\\.");
-  const assetVersion = new RegExp(`(?:-|v)${escaped}(?:[.-]|$)`, "u");
+  const releaseAssets = [
+    `spool-client-${version}.crate`,
+    `spool-guest-${version}-linux-amd64.tar.gz`,
+    ...cliPlatforms.map((platform) => cliArchiveName(version, platform)),
+  ];
   for (const file of await readdir(output)) {
-    if (assetVersion.test(file) && !entries.some((entry) => entry.file === file) && /\.(crate|tar\.gz)$/u.test(file)) entries.push({ file });
+    if (releaseAssets.includes(file)) entries.push({ file });
   }
   entries.sort((left, right) => left.file.localeCompare(right.file));
   for (const item of entries) item.sha256 = createHash("sha256").update(await readFile(join(output, item.file))).digest("hex");

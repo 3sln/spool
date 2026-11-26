@@ -35,7 +35,11 @@ export function publicEndpoint(auth, origins, execution, dispatch, limits) {
     if (request.method === "GET" && path === discovery) return json(advertised);
     if (request.method === "GET" && path === oauthMetadata && auth.metadata) return json(auth.metadata);
     if (!path.startsWith("/v1/")) return notFound();
-    return dispatch(request, await tenantFor(auth, request));
+    const tenant = await tenantFor(auth, request);
+    if (request.method === "GET" && path === "/v1/auth/check") {
+      return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    }
+    return dispatch(request, tenant);
   }
   return async (request) => {
     const origin = request.headers.get("origin");

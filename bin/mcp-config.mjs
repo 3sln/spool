@@ -9,20 +9,26 @@ const defaults = {
 };
 const modes = new Set(["shared", "isolated", "custom"]);
 const usage = `Usage:
-  spool-mcp [serve] [--runner URL] [--workspace PATH]
+  spool-mcp [serve] [--runner URL] [--profile NAME] [--workspace PATH]
             [--state-mode shared|isolated|custom] [--state-dir PATH]
   spool-mcp init [--client project|claude|cursor] [--config PATH]
-                 [--runner URL] [--workspace PATH] [--state-mode MODE]
+                 [--runner URL] [--profile NAME] [--workspace PATH] [--state-mode MODE]
                  [--state-dir PATH] [--name NAME] [--force] [--dry-run]
+  spool-mcp cache-gc [--state-dir PATH]
+  spool-mcp auth login --profile NAME --runner URL
+                [--scheme bearer|oauth] [--token-stdin]
+                [--issuer URL] [--client-id ID] [--scope SCOPE] [--redirect-port PORT]
+  spool-mcp auth list
+  spool-mcp auth logout --profile NAME
   spool-mcp --version
 
-Use SPOOL_TOKEN or Access service credentials in the MCP host environment.
+Use a profile or SPOOL_TOKEN in the MCP host environment.
 init writes startup arguments only.`;
 
-const serveFlags = ["runner", "workspace", "state-mode", "state-dir"];
+const serveFlags = ["runner", "profile", "workspace", "state-mode", "state-dir"];
 const initFlags = [...serveFlags, "client", "config", "name", "force", "dry-run"];
 
-function validRunner(value) {
+export function validRunner(value) {
   if (!value) return undefined;
   const url = new URL(value);
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== "/") {
@@ -42,14 +48,26 @@ function normalizeState(mode, directory) {
 export function parseCli(args) {
   const result = { command: "serve" };
   if (args[0] === "--version") return { command: "version" };
-  if (args[0] === "init" || args[0] === "serve") result.command = args.shift();
+  if (["init", "serve", "cache-gc", "auth"].includes(args[0])) result.command = args.shift();
   if (args[0] === "--help" || args[0] === "-h") return { command: "help" };
-  const allowed = result.command === "init" ? initFlags : serveFlags;
+  let allowed = serveFlags;
+  if (result.command === "init") allowed = initFlags;
+  if (result.command === "cache-gc") allowed = ["state-dir"];
+  if (result.command === "auth") {
+    result.action = args.shift();
+    const authFlags = {
+      login: ["runner", "profile", "scheme", "token-stdin", "issuer", "client-id", "scope", "redirect-port"],
+      logout: ["profile"],
+      list: [],
+    };
+    if (!Object.hasOwn(authFlags, result.action)) throw new TypeError("Use auth login, auth list, or auth logout");
+    allowed = authFlags[result.action];
+  }
   while (args.length) {
     const flag = args.shift();
     const key = flag.startsWith("--") ? flag.slice(2) : "";
     if (!allowed.includes(key) || Object.hasOwn(result, key)) throw new TypeError(`Unexpected or repeated option: ${flag}`);
-    if (["force", "dry-run"].includes(key)) result[key] = true;
+    if (["force", "dry-run", "token-stdin"].includes(key)) result[key] = true;
     else {
       if (!args[0] || args[0].startsWith("--")) throw new TypeError(`Option ${flag} requires a value`);
       result[key] = args.shift();
@@ -59,7 +77,7 @@ export function parseCli(args) {
   return result;
 }
 
-function stateHome(env) {
+export function stateHome(env) {
   if (env.XDG_STATE_HOME) return env.XDG_STATE_HOME;
   if (process.platform === "win32") return env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
   if (process.platform === "darwin") return join(homedir(), "Library", "Application Support");
@@ -74,7 +92,7 @@ export async function cliState(options, env) {
   if (state.mode === "isolated") {
     if (env.SPOOL_BLOB_DIR) throw new TypeError("SPOOL_BLOB_DIR cannot be used in isolated mode");
     const directory = await mkdtemp(join(tmpdir(), "spool-mcp-"));
-    return { blobs: join(directory, "layers"), close: () => rm(directory, { recursive: true, force: true }) };
+    return { isolated: true, blobs: join(directory, "layers"), close: () => rm(directory, { recursive: true, force: true }) };
   }
   const directory = resolve(state.directory ?? join(stateHome(env), "spool"));
   return { blobs: resolve(env.SPOOL_BLOB_DIR ?? join(directory, "layers")), close: async () => {} };

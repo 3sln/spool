@@ -1,5 +1,5 @@
 {
-  "name": "@3sln/spool",
+  "name": "@3sln/spool-client",
   "version": "0.1.0",
   "private": true,
   "type": "module",

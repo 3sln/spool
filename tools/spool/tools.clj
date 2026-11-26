@@ -2,6 +2,7 @@
   (:require [babashka.fs :as fs]
             [babashka.process :refer [shell]]
             [cheshire.core :as json]
+            [clojure.edn :as edn]
             [clojure.string :as str]))
 
 (defn- env [key fallback]
@@ -56,9 +57,18 @@
         (finally
           (shell "docker" "stop" broker))))))
 
+(defn release-version [path]
+  (let [source (if (= "-" path) (slurp *in*) (slurp (or path "version.edn")))
+        version (:version (edn/read-string source))]
+    (when-not (and (string? version)
+                   (re-matches #"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?" version))
+      (throw (ex-info "Expected a semantic version in version.edn" {})))
+    version))
+
 (defn build-release [destination]
   (let [dest (or destination "dist")
-        version (:version (json/parse-string (slurp "package.json") true))]
+        version (release-version nil)]
+    (shell "node" "release/stamp.mjs" version "--check")
     (doseq [manifest ["sdk/rust/Cargo.toml" "guest/Cargo.toml"]]
       (when-not (= version (second (re-find #"(?m)^version = \"([^\"]+)\"" (slurp manifest))))
         (throw (ex-info "Rust and npm package versions differ" {:manifest manifest}))))
@@ -76,5 +86,7 @@
           (shell "gzip" "-n" tar)
           (fs/move (str tar ".gz") (fs/path dest (str "spool-guest-" version "-linux-amd64.tar.gz")) {:replace-existing true})
           (finally (fs/delete-tree temp)))))
+    (when (= "1" (System/getenv "SPOOL_RELEASE_CLI"))
+      (shell "node" "release/binary.mjs" dest))
     (shell "node" "release/package.mjs" dest)
     (shell "node" "release/check.mjs" dest)))

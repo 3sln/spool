@@ -6,6 +6,8 @@ Discover bases, media types, limits, and authentication at `/.well-known/portabl
 
 The authenticated principal and `client_request_id` identify one submission for 24 hours after finalization. Repeating the same manifest returns the original resource. Submitting different content with the same key returns HTTP 409. Treat each `task_id` as opaque. A layer's SHA-256 covers the transmitted bytes, including compression. An environment's SHA-256 covers the UTF-8 canonical JSON of `{platform,environment}`. Canonical JSON recursively sorts object keys by UTF-16 code unit, preserves array order, and uses ECMAScript JSON string and integer formatting with no extra whitespace.
 
+The discovery document reports the auth profile. OAuth runners expose [protected-resource metadata](https://www.rfc-editor.org/rfc/rfc9728.html) at `/.well-known/oauth-protected-resource`. Clients can verify credentials with `GET /v1/auth/check`, which returns HTTP 204 after authentication without creating a task.
+
 ## Deadlines and states
 
 Every submission supplies a positive `task_timeout_s`. It starts at acceptance and covers layer uploads, queueing, startup, and execution. The runner advertises `limits.max_task_seconds`, which fixes `hard_deadline` at acceptance. The status field `task_deadline` is the requested whole-task deadline. `deadline` is the effective deadline in the current state. While waiting for layers or queueing, it is also bounded by the admission window. An optional `resources.timeout_s` separately limits command runtime. `execution_deadline_limit` gives the latest effective deadline the runner can grant after claiming the task.
