@@ -100,7 +100,7 @@ Bind a cache to a workspace with `openLayerCache(path, { workspace })` or `await
 
 `cache.retain(digest)` claims an existing layer. `cache.renew()` extends the workspace's still-valid references. `cache.release()` returns all its references to that cache and removes its marker. Deleting or moving the workspace also invalidates its references. `cache.gc()` removes a layer once every workspace reference has expired, been returned, or lost its marker. A cache opened without a workspace can run GC and inspect layers. Existing unleased content is eligible for collection, so bind existing projects and retain any contents they still need before the first GC.
 
-For presigned transfers, pass an `allowTransferURL` callback that accepts the configured object storage origin. The SDK omits runner credentials from presigned requests. A browser client also needs bucket CORS to allow its origin and PUT requests and to expose the response `ETag`.
+The SDK follows HTTPS upload URLs from the runner by default and omits runner credentials from off-origin requests. Pass an `allowTransferURL` callback to restrict direct uploads and enable direct artifact downloads from selected origins. A browser client also needs bucket CORS to allow its origin and PUT requests and to expose the response `ETag`.
 
 `wait` supplies only requested digests and polls until the task finishes. `client.events` streams live logs and state changes over SSE, resuming from the last cursor. `client.eventPage(id, {cursor, limit})` reads the same events as JSON pages. Check `deadline` and `execution_deadline_limit` in status, then call `client.extend(id, 600)` to ask for a new deadline 600 seconds from original acceptance. Cancel the local wait with an abort signal or cancel the remote task explicitly with `client.cancel`. `client.artifacts` and `client.download` list and retrieve results.
 
@@ -247,7 +247,7 @@ approval for project-scoped servers. To register across projects in Claude
 Code, run `spool-mcp init --client claude --scope user --profile NAME`. The
 adapter uses Claude's current project directory when no workspace is passed.
 [Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#mcp-installation-scopes)
-Set `SPOOL_TRANSFER_ORIGINS` to a comma-separated list of allowed HTTPS storage origins for direct uploads and downloads.
+Optionally set `SPOOL_TRANSFER_ORIGINS` to restrict direct uploads to a comma-separated list of HTTPS storage origins and enable direct artifact downloads from those origins.
 
 Shared mode uses a per-user local disk cache so separate stdio processes share
 both completed layers and in-flight builds. Use `--state-mode isolated` for a cache that is removed
@@ -320,7 +320,7 @@ A SQLite Durable Object queues one running task per tenant. The storage provider
 
 The binding lets the Worker read, write, and clean up its bucket with Cloudflare-managed access. Gateway transfers work with just the binding. Direct transfers require separate S3 signing credentials. [Cloudflare R2 bindings and presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/)
 
-Enable direct R2 transfers by setting `SPOOL_R2_ENDPOINT` to your account's R2 S3 API origin and `SPOOL_R2_BUCKET` to the bucket bound as `LAYERS`. Store `SPOOL_R2_ACCESS_KEY_ID` and `SPOOL_R2_SECRET_ACCESS_KEY` as Worker secrets with read and write access scoped to that bucket. The binding manages objects and multipart sessions. The signing key stays in the Worker. Layer uploads up to 32 MiB use a presigned PUT, larger layers use presigned multipart URLs, and artifact downloads use presigned GET. A Worker without signing credentials offers gateway PUT for layers up to 32 MiB and authenticated gateway downloads. Set `SPOOL_TRANSFER_ORIGINS` to allow the storage origin for direct transfers.
+Enable direct R2 transfers by setting `SPOOL_R2_ENDPOINT` to your account's R2 S3 API origin and `SPOOL_R2_BUCKET` to the bucket bound as `LAYERS`. Store `SPOOL_R2_ACCESS_KEY_ID` and `SPOOL_R2_SECRET_ACCESS_KEY` as Worker secrets with read and write access scoped to that bucket. The binding manages objects and multipart sessions. The signing key stays in the Worker. Layer uploads up to 32 MiB use a presigned PUT, larger layers use presigned multipart URLs, and artifact downloads use presigned GET. A Worker without signing credentials offers gateway PUT for layers up to 32 MiB and authenticated gateway downloads.
 
 ### Storage through the S3 API
 
@@ -332,7 +332,7 @@ export { TenantRunner, GuestSlot } from "@3sln/spool-runner/worker-s3";
 export default createS3WorkerRunner();
 ```
 
-Set `SPOOL_S3_BUCKET` and `SPOOL_S3_REGION` (defaults to `us-east-1`). Set `SPOOL_S3_ENDPOINT` to the provider's HTTPS origin for non-AWS storage. The runner uses path-style bucket addressing. Store `SPOOL_S3_ACCESS_KEY_ID` and `SPOOL_S3_SECRET_ACCESS_KEY` as Worker secrets, with `SPOOL_S3_SESSION_TOKEN` when your credentials include a session token. The credentials need read, write, delete, and multipart access to that bucket. Allow the storage origin in the client to use presigned single PUT, multipart, and GET transfers.
+Set `SPOOL_S3_BUCKET` and `SPOOL_S3_REGION` (defaults to `us-east-1`). Set `SPOOL_S3_ENDPOINT` to the provider's HTTPS origin for non-AWS storage. The runner uses path-style bucket addressing. Store `SPOOL_S3_ACCESS_KEY_ID` and `SPOOL_S3_SECRET_ACCESS_KEY` as Worker secrets, with `SPOOL_S3_SESSION_TOKEN` when your credentials include a session token. The credentials need read, write, delete, and multipart access to that bucket.
 
 ## JetStream workers
 

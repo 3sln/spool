@@ -40,6 +40,8 @@ The initial manifest declares each layer's exact compressed or raw transfer size
 
 Discovery advertises `layer-pull` when enabled. A requested layer's plan then includes a same-origin `pull_url`. POST a JSON string containing a presigned HTTPS GET URL, or an object with `url`, optional `method: "GET"`, `headers` and `expires_at`. Send source credentials in this request with only the permissions and lifetime needed for the download. The runner applies its origin policy, refuses redirects, and verifies the declared size and digest before recording the layer. The call returns current task status after verification. A plan with type `http-pull` requires this flow. Other plan types can still be used for uploads.
 
+Clients can follow off-origin HTTPS PUT URLs issued by the runner. Keep runner authentication on the runner origin and reject redirects on transfer requests. Clients can further restrict storage origins through local policy.
+
 - `http-put` uploads exact bytes to the runner URL using its existing caller authentication.
 - `presigned-put` uploads exact bytes directly to object storage, then POSTs `{"parts":[]}` to the runner's `complete_url`.
 - `presigned-multipart` uploads each plan range to its own URL. Take the returned `ETag` for each part, then POST `{"parts":[{"number":1,"etag":"..."}]}` to the runner's `complete_url` in order. The runner completes the provider upload and verifies the assembled content. Retrying a part uses the same range and URL while the plan is valid.

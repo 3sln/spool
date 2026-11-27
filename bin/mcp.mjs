@@ -19,9 +19,10 @@ const sourceOptions = (options) => ({
 });
 
 async function runnerClient(options, env, cache) {
+  const origins = (env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((item) => item.trim()).filter(Boolean);
   return createClient({
     ...await runnerConnection(options, env),
-    allowTransferURL: (url) => (env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((item) => item.trim()).includes(url.origin),
+    ...(origins.length && { allowTransferURL: (url) => origins.includes(url.origin) }),
     layerSource: cache.open,
     layerPullSource: cache.pullPlan,
   });

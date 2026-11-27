@@ -80,16 +80,17 @@ async function* frames(body) {
 }
 
 export function createClient({
-  url, fetch: transport = globalThis.fetch, headers, layerSource, layerPullSource, allowTransferURL = () => false,
+  url, fetch: transport = globalThis.fetch, headers, layerSource, layerPullSource, allowTransferURL,
 } = {}) {
   const base = new URL(url);
   if (!["http:", "https:"].includes(base.protocol) || base.username || base.password) throw new TypeError("Invalid runner URL");
 
-  async function request(path, { method = "GET", body, signal, extra, transfer = false, authenticated = true } = {}) {
+  async function request(path, { method = "GET", body, signal, extra, transfer, authenticated = true } = {}) {
     const target = new URL(path, base);
     const ownOrigin = target.origin === base.origin;
     if (target.username || target.password || (!ownOrigin && (
-      !transfer || authenticated || target.protocol !== "https:" || !await allowTransferURL(target)
+      !transfer || authenticated || target.protocol !== "https:"
+      || !(allowTransferURL ? await allowTransferURL(target) : transfer === "upload")
     ))) throw new SpoolError("UNTRUSTED_URL", "Runner returned a URL outside the allowed origins");
 
     const outbound = new Headers(ownOrigin && authenticated ? (typeof headers === "function" ? await headers() : headers) : undefined);
@@ -144,7 +145,7 @@ export function createClient({
       throw new SpoolError("UNSUPPORTED_UPLOAD", "Runner did not offer a PUT transfer");
     }
     const put = (url, body) => retry(() => request(url, {
-      method: "PUT", body, signal, transfer: true, authenticated: offer.authenticated !== false,
+      method: "PUT", body, signal, transfer: "upload", authenticated: offer.authenticated !== false,
       extra: { "content-type": "application/octet-stream", ...(offer.bearer_token
         ? { authorization: `Bearer ${offer.bearer_token}` } : {}) },
     }), signal);
@@ -246,7 +247,7 @@ export function createClient({
     async download(artifact, { signal } = {}) {
       const plan = await downloadPlan(artifact, { signal });
       try {
-        return await request(plan.url, { transfer: true, authenticated: plan.authenticated, signal });
+        return await request(plan.url, { transfer: "download", authenticated: plan.authenticated, signal });
       } catch (error) {
         if (plan.type !== "presigned-get" || !(error.code === "UNTRUSTED_URL" || [403, 404].includes(error.status))) throw error;
         return request(artifact.url, { signal });

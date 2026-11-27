@@ -105,6 +105,8 @@ test("direct upload plans scope signed parts and require proof of content before
     urls++;
     assert.equal(options.headers.get("authorization"), null);
     assert.equal(options.method, "PUT");
+    assert.equal(options.redirect, "error");
+    assert.equal(options.credentials, "omit");
     assert.match(url.searchParams.get("X-Amz-Signature"), /^[a-f0-9]{64}$/u);
     assert.match(url.searchParams.get("X-Amz-SignedHeaders"), /content-length/u);
     const key = url.pathname.split("/").slice(2).map(decodeURIComponent).join("/");
@@ -117,7 +119,8 @@ test("direct upload plans scope signed parts and require proof of content before
     return new Response(null, { headers: { etag: '"' + etag(bytes) + '"' } });
   };
   const logIn = { url: "https://runner.test", headers: { authorization: "Bearer fixture-token" }, fetch };
-  const client = createClient({ ...logIn, allowTransferURL: (url) => url.origin === "https://fixture.object-store.test" });
+  const client = createClient(logIn);
+  const restricted = createClient({ ...logIn, allowTransferURL: (url) => url.origin === "https://other.test" });
   const capabilities = await client.capabilities();
   assert.deepEqual(capabilities.upload_transports, ["presigned-put", "presigned-multipart"]);
   assert.equal(capabilities.limits.max_artifact_bytes_total, 512 * 1024);
@@ -133,7 +136,15 @@ test("direct upload plans scope signed parts and require proof of content before
     const plan = task.upload_plans[descriptor.digest];
     assert.equal(plan.max_size, size);
     assert.equal(plan.type, size > directSingleBytes ? "presigned-multipart" : "presigned-put");
-    await assert.rejects(createClient(logIn).supply(task.task_id, task.required, { source: () => bytes, plans: task.upload_plans }),
+    if (plan.type === "presigned-put") {
+      const offer = await (await fetch(new URL(plan.prepare_url, logIn.url), { method: "POST" })).json();
+      const supply = (overrides) => client.supply(task.task_id, task.required, {
+        source: () => bytes, plans: { [descriptor.digest]: { ...offer, ...overrides } },
+      });
+      await assert.rejects(supply({ authenticated: true }), { code: "UNTRUSTED_URL" });
+      await assert.rejects(supply({ url: offer.url.replace(/^https:/u, "http:") }), { code: "UNTRUSTED_URL" });
+    }
+    await assert.rejects(restricted.supply(task.task_id, task.required, { source: () => bytes, plans: task.upload_plans }),
       { code: "UNTRUSTED_URL" });
     await client.supply(task.task_id, task.required, { source: () => bytes, plans: task.upload_plans });
     assert.equal((await client.status(task.task_id)).state, "QUEUED");

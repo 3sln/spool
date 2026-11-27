@@ -9,10 +9,10 @@ the JavaScript SDK.
 
 Pass a header callback to `Client::new` to provide bearer or Access credentials
 for each request. A local wait timeout leaves the remote task running. Save the
-accepted task ID and keep its layers in the cache to resume the wait. This
-binding uses same-origin transfers by default. Add a configured storage
-origin with `Client::with_transfer_origin` to use presigned PUT and multipart
-plans without sending runner credentials there. For large prepared archives
+accepted task ID and keep its layers in the cache to resume the wait. The SDK
+follows HTTPS upload URLs from the runner and omits runner credentials on
+off-origin requests. Use `Client::with_transfer_origin` to restrict direct
+uploads and enable direct artifact downloads from registered origins. For large prepared archives
 use `describe_reader` and `Client::upload_file` for streaming from disk.
 The JavaScript SDK also compiles JSON Taskfiles.
 

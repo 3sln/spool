@@ -14,9 +14,9 @@ if (process.env.SPOOL_ACCESS_CLIENT_ID && process.env.SPOOL_ACCESS_CLIENT_SECRET
 const directory = await mkdtemp(join(tmpdir(), "spool-smoke-"));
 try {
   const cache = await openLayerCache(directory);
-  const origins = (process.env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((origin) => origin.trim());
+  const origins = (process.env.SPOOL_TRANSFER_ORIGINS ?? "").split(",").map((origin) => origin.trim()).filter(Boolean);
   const client = createClient({ url: process.env.SPOOL_URL ?? "http://127.0.0.1:8787", headers,
-    layerSource: cache.open, allowTransferURL: (url) => origins.includes(url.origin) });
+    layerSource: cache.open, ...(origins.length && { allowTransferURL: (url) => origins.includes(url.origin) }) });
   const signal = AbortSignal.timeout(150_000);
   const message = `Spool smoke ${crypto.randomUUID()}\n`;
   const descriptor = await cache.put(buildLayer([{

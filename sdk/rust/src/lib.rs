@@ -192,7 +192,7 @@ impl Client {
         })
     }
 
-    /// Permit anonymous, signed transfers to this explicit HTTPS origin.
+    /// Restrict off-origin uploads to registered HTTPS origins and enable downloads from them.
     pub fn with_transfer_origin(mut self, origin: &str) -> Result<Self> {
         let url = Url::parse(origin).map_err(|_| Error::Invalid("Invalid transfer origin"))?;
         if url.scheme() != "https"
@@ -222,14 +222,15 @@ impl Client {
             .base
             .join(path)
             .map_err(|_| Error::Invalid("Invalid runner response URL"))?;
-        if (url.origin() != self.base.origin()
-            && (authenticated
-                || url.scheme() != "https"
-                || !self
-                    .transfer_origins
-                    .contains(&url.origin().ascii_serialization())))
-            || !url.username().is_empty()
+        let origin = url.origin();
+        let allow_off_origin = method == "PUT" && self.transfer_origins.is_empty()
+            || self
+                .transfer_origins
+                .contains(&origin.ascii_serialization());
+        if !url.username().is_empty()
             || url.password().is_some()
+            || (origin != self.base.origin()
+                && (authenticated || url.scheme() != "https" || !allow_off_origin))
         {
             return Err(Error::Invalid("Runner returned an off-origin transfer URL"));
         }

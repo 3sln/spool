@@ -60,7 +60,8 @@ Environment
   SPOOL_BLOB_DIR              Override the layer directory for shared or custom state.
   SPOOL_AUTH_DIR              Override the location of saved credentials.
   SPOOL_CACHE_LEASE_SECONDS   Override the default seven-day workspace lease.
-  SPOOL_TRANSFER_ORIGINS      Comma-separated HTTPS origins for direct transfers.
+  SPOOL_TRANSFER_ORIGINS      Optional HTTPS origin list for restricting direct uploads
+                              and enabling direct artifact downloads.
   SPOOL_BUILD_ENGINES         Ordered local build engines. Defaults to docker,podman.
   SPOOL_BUILD_TMPDIR          Scratch directory shared with the build engine.
 
